@@ -4,6 +4,9 @@ import logging
 from typing import Any
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from agent.core.exceptions import (
     LLMContextWindowExceededError,
@@ -17,6 +20,7 @@ from agent.core.models.message import Message, ToolCall, ToolCallFunction
 from agent.core.models.usage import Usage
 from agent.core.registries.llm import LLMRegistry
 from agent.core.run_context import collect_extra_usage, run_context
+from agent.core.services import compaction as compaction_module
 from agent.core.services.compaction import (
     CompactionService,
     _chunk_by_turns,
@@ -24,6 +28,7 @@ from agent.core.services.compaction import (
 )
 from agent.core.services.context_tracker import ContextFootprintTracker
 from agent.core.session_stores.in_memory import InMemorySessionStore
+from agent.core.tracing import set_capture_content
 
 
 class _FakeLLM:
@@ -1186,6 +1191,120 @@ async def test_compact_given_success_logs_info(caplog: pytest.LogCaptureFixture)
     await service.compact("researcher", session_id)
 
     assert any(r.levelno == logging.INFO and "compacted" in r.message for r in caplog.records)
+
+
+# — compact: tracing ------------------------------------------------------------------------
+
+
+async def test_compact_given_something_to_summarize_opens_a_compaction_span(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(compaction_module, "tracer", provider.get_tracer("test"))
+    llm_registry = LLMRegistry()
+    llm_registry.register("summarizer", _FakeLLM(completion=_summary_completion()))
+    store, session_id = await _seeded_store([_turn(1), _turn(2), _turn(3)])
+    tracker = ContextFootprintTracker()
+    service = CompactionService(llm_registry, store, _config(keep_recent_turns=1), tracker)
+
+    await service.compact("researcher", session_id)
+
+    assert any(s.name == "compaction" for s in exporter.get_finished_spans())
+
+
+async def test_compact_given_something_to_summarize_sets_span_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(compaction_module, "tracer", provider.get_tracer("test"))
+    llm_registry = LLMRegistry()
+    llm_registry.register("summarizer", _FakeLLM(completion=_summary_completion("gist")))
+    store, session_id = await _seeded_store([_turn(1), _turn(2), _turn(3)])
+    tracker = ContextFootprintTracker()
+    service = CompactionService(llm_registry, store, _config(keep_recent_turns=1), tracker)
+
+    await service.compact("researcher", session_id)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "compaction"]
+    assert span.attributes is not None
+    assert span.attributes["gen_ai.agent.name"] == "researcher"
+    assert span.attributes["gen_ai.conversation.id"] == session_id
+    assert span.attributes["agent_core.compaction.old_content_chars"] > 0
+    assert span.attributes["agent_core.compaction.new_content_chars"] > 0
+    assert (
+        span.attributes["agent_core.compaction.new_content_chars"]
+        < span.attributes["agent_core.compaction.old_content_chars"]
+    )
+
+
+async def test_compact_given_unexpected_error_span_records_error_type(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(compaction_module, "tracer", provider.get_tracer("test"))
+    llm_registry = LLMRegistry()
+    llm_registry.register("summarizer", _FakeLLM(completion=RuntimeError("boom")))
+    store, session_id = await _seeded_store([_turn(1), _turn(2), _turn(3)])
+    tracker = ContextFootprintTracker()
+    service = CompactionService(llm_registry, store, _config(keep_recent_turns=1), tracker)
+
+    with pytest.raises(RuntimeError):
+        await service.compact("researcher", session_id)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "compaction"]
+    assert span.attributes["error.type"] == "RuntimeError"
+    assert span.status.description is None
+    assert span.events == ()
+
+
+async def test_compact_given_unexpected_error_span_records_it_when_capturing_content(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(compaction_module, "tracer", provider.get_tracer("test"))
+    llm_registry = LLMRegistry()
+    llm_registry.register("summarizer", _FakeLLM(completion=RuntimeError("boom")))
+    store, session_id = await _seeded_store([_turn(1), _turn(2), _turn(3)])
+    tracker = ContextFootprintTracker()
+    service = CompactionService(llm_registry, store, _config(keep_recent_turns=1), tracker)
+
+    set_capture_content(True)
+    try:
+        with pytest.raises(RuntimeError):
+            await service.compact("researcher", session_id)
+    finally:
+        set_capture_content(False)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "compaction"]
+    assert span.attributes["error.type"] == "RuntimeError"
+    assert span.status.description == "boom"
+    assert len(span.events) == 1
+
+
+async def test_compact_given_nothing_to_summarize_opens_no_compaction_span(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(compaction_module, "tracer", provider.get_tracer("test"))
+    llm_registry = LLMRegistry()
+    llm_registry.register("summarizer", _FakeLLM(completion=_summary_completion()))
+    store, session_id = await _seeded_store([_turn(1)])
+    tracker = ContextFootprintTracker()
+    service = CompactionService(llm_registry, store, _config(keep_recent_turns=4), tracker)
+
+    await service.compact("researcher", session_id)
+
+    assert not any(s.name == "compaction" for s in exporter.get_finished_spans())
 
 
 async def test_compact_given_truncated_summary_logs_error(caplog: pytest.LogCaptureFixture):

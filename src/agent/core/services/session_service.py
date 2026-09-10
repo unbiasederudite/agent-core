@@ -3,7 +3,7 @@
 import logging
 
 from agent.core.models.message import Message
-from agent.core.models.usage import ZERO_USAGE, Usage
+from agent.core.models.usage import Usage
 from agent.core.protocols.isession_store import ISessionStore
 from agent.core.services.context_tracker import ContextFootprintTracker
 from agent.core.services.cost_tracker import CostTracker
@@ -48,7 +48,7 @@ class SessionService:
         """
         return await self._session_store.get(agent, session_id)
 
-    async def get_usage(self, agent: str, session_id: str) -> tuple[Usage, int]:
+    async def get_usage(self, agent: str, session_id: str) -> tuple[Usage | None, int | None]:
         """Return (cumulative usage, context_tokens) for this session.
 
         Args:
@@ -56,7 +56,8 @@ class SessionService:
             session_id: Session to look up.
 
         Returns:
-            tuple[Usage, int]: cumulative usage and current context token count.
+            tuple[Usage | None, int | None]: cumulative usage and current context token
+            count, each `None` if this session's own tracking record was evicted.
 
         Raises:
             SessionNotFoundError: no session exists for this exact pair.
@@ -64,10 +65,7 @@ class SessionService:
         await self._session_store.get(agent, session_id)
         usage = self._cost_tracker.session_usage(agent, session_id)
         context_tokens = self._context_tracker.get(agent, session_id)
-        return (
-            usage if usage is not None else ZERO_USAGE,
-            context_tokens if context_tokens is not None else 0,
-        )
+        return (usage, context_tokens)
 
     async def delete(self, agent: str, session_id: str) -> None:
         """Permanently remove `(agent, session_id)` and forget its recorded usage state.

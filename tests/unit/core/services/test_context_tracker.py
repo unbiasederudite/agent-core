@@ -51,33 +51,9 @@ def test_forget_given_unknown_session_does_not_raise():
     tracker.forget("researcher", "does-not-exist")  # must not raise
 
 
-def test_record_evicts_least_recently_touched_session_over_max_sessions():
-    tracker = ContextFootprintTracker(max_sessions=2)
-    tracker.record("researcher", "s1", 1)
-    tracker.record("researcher", "s2", 1)
-
-    tracker.record("researcher", "s3", 1)
-
-    assert tracker.get("researcher", "s1") is None
-    assert tracker.get("researcher", "s2") is not None
-    assert tracker.get("researcher", "s3") is not None
-
-
-def test_record_touching_a_session_protects_it_from_eviction():
-    tracker = ContextFootprintTracker(max_sessions=2)
-    tracker.record("researcher", "s1", 1)
-    tracker.record("researcher", "s2", 1)
-
-    tracker.record("researcher", "s1", 1)
-    tracker.record("researcher", "s3", 1)
-
-    assert tracker.get("researcher", "s1") is not None
-    assert tracker.get("researcher", "s2") is None
-    assert tracker.get("researcher", "s3") is not None
-
-
-def test_record_given_max_sessions_none_never_evicts():
-    tracker = ContextFootprintTracker(max_sessions=None)
+def test_record_never_evicts_on_its_own():
+    """Eviction is the session store's call alone, cascaded via `forget()`."""
+    tracker = ContextFootprintTracker()
 
     for i in range(50):
         tracker.record("researcher", f"s{i}", 1)

@@ -6,8 +6,8 @@ Inbound HTTP adapter. Thin translation layer between HTTP and `core/services/` �
 
 - `schemas.py` — backend-native request/response models for the agent-run and registry-listing routes.
 - `app.py` — `create_app(config_path)` builds and wires the FastAPI app: routes, middleware, and exception handlers.
-- `logging_setup.py` — JSON/text log formatting, handlers, and correlation filters.
-- `request_context.py` — request-id correlation middleware and its logging filter.
+- `logging_setup.py` — JSON/text log formatting, handlers, and correlation filters; stamps `trace_id`/`span_id` onto log records from the currently active span.
+- `request_context.py` — request-id correlation middleware and its logging filter; opens the root HTTP span (named `"{method} {route}"`) and derives `request_id` from its trace id.
 - `__main__.py` — CLI entrypoint: parses `--config`/`--host`/`--port` and starts the server.
 
 ## Running
@@ -48,7 +48,9 @@ Every error body is `{"detail": {"message": "...", "code": "...", "request_id": 
 | 413 | `context_window_exceeded` | Overflowed the model's context window; compaction unavailable. |
 | 413 | `compaction_exhausted` | Overflowed the context window; compaction was tried and didn't help. |
 | 422 | `guardrail_blocked` | A block-action input or output guardrail triggered. |
+| 400 | *(none)* | Safety-net fallback for a `ClientError` not covered by any row above. |
 | 429 | *(none)* | Provider rate-limited the request. Carries a `Retry-After` header. |
+| 429 | `too_many_concurrent_requests` | `AppConfig`'s `max_concurrent_requests` cap reached. Carries a `Retry-After` header. |
 | 500 | *(none)* | Unhandled server error. Body includes `request_id`. |
 | 502 | *(none)* | Other LLM call failure. Body includes `request_id`. |
 | 503 | *(none)* | Model's `max_concurrent_requests` cap reached. Carries a `Retry-After` header. |

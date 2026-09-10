@@ -4,7 +4,7 @@ import asyncio
 import logging
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 from agent.core.exceptions import SessionBusyError, SessionNotFoundError
@@ -16,16 +16,23 @@ logger = logging.getLogger(__name__)
 class InMemorySessionStore:
     """Session history backed by a process-local dict. Lost on restart."""
 
-    def __init__(self, max_sessions: int | None = None) -> None:
+    def __init__(
+        self,
+        max_sessions: int | None = None,
+        on_evict: Callable[[str, str], None] | None = None,
+    ) -> None:
         """Initialize an empty session store.
 
         Args:
             max_sessions: Maximum number of sessions kept at once. `None` means unbounded.
+            on_evict: Called with `(agent, session_id)` when this store evicts a session,
+                so other per-session state keyed the same way can be kept in sync.
         """
         self._sessions: OrderedDict[tuple[str, str], list[Message]] = OrderedDict()
         self._locks: OrderedDict[tuple[str, str], asyncio.Lock] = OrderedDict()
         self._busy: set[tuple[str, str]] = set()
         self._max_sessions = max_sessions
+        self._on_evict = on_evict
 
     def _evict_if_over_capacity(self, protect: tuple[str, str]) -> None:
         """Evict the oldest-touched session once the session count exceeds `max_sessions`.
@@ -43,6 +50,8 @@ class InMemorySessionStore:
                 continue
             del self._sessions[key]
             self._locks.pop(key, None)
+            if self._on_evict is not None:
+                self._on_evict(*key)
             return
 
     async def create(self, agent: str) -> str:
@@ -128,7 +137,9 @@ class InMemorySessionStore:
         else:
             self._locks.move_to_end(key)
         if session_lock.locked():
-            logger.debug("waiting for session lock (%s, %s), currently held", agent, session_id)
+            logger.debug(
+                "waiting for session lock agent=%s session=%s, currently held", agent, session_id
+            )
         try:
             async with session_lock:
                 yield

@@ -1,14 +1,18 @@
+import asyncio
 import logging
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from agent.api import app as app_module
 from agent.api.app import add_agent_run_route, add_exception_handlers
 from agent.api.request_context import RequestIdMiddleware
 from agent.core.exceptions import (
     AgentError,
     AgentNotFoundError,
+    ClientError,
     GuardrailBlockedError,
     GuardrailNotFoundError,
     LLMError,
@@ -59,6 +63,31 @@ class _StubAgentRunService(AgentRunService):
         if isinstance(self._result, Exception):
             raise self._result
         return self._result
+
+
+class _BlockingAgentRunService(AgentRunService):
+    """Signals `started` on entry, then blocks until `release` is set."""
+
+    def __init__(self, started: asyncio.Event, release: asyncio.Event) -> None:
+        self._started = started
+        self._release = release
+
+    async def run(
+        self,
+        message: str,
+        agent: str,
+        *,
+        model: str | None = None,
+        strategy: str | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        max_tokens: int | None = None,
+        tools: list[str] | None = None,
+        session_id: str | None = None,
+    ) -> Run:
+        self._started.set()
+        await self._release.wait()
+        return _run()
 
 
 def _run(finish_reason: str = "stop", session_id: str = "sess_1") -> Run:
@@ -256,7 +285,34 @@ def test_run_agent_given_timeout_error_returns_504():
     assert response.status_code == 504
 
 
-def test_run_agent_given_generic_agent_error_returns_500():
+def test_run_agent_given_client_error_not_in_the_uniform_map_returns_400_not_500():
+    # Safety net: a ClientError subtype not (yet) listed in _UNIFORM_ERROR_MAP must still
+    # degrade to a generic 4xx, never the 500 the final AgentError catch-all would otherwise
+    # produce — a deliberate rejection must never look like a server failure to the caller.
+    client = _client_for(ClientError("some deliberate rejection"))
+
+    response = client.post("/v1/agents/researcher", json={"message": "hi"})
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["message"] == "some deliberate rejection"
+
+
+def _all_subclasses(cls: type) -> set[type]:
+    return set(cls.__subclasses__()).union(
+        *(_all_subclasses(subclass) for subclass in cls.__subclasses__())
+    )
+
+
+def test_uniform_error_map_covers_every_client_error_subtype():
+    # The `except ClientError` safety net in add_agent_run_route exists specifically so a
+    # ClientError subtype missing from _UNIFORM_ERROR_MAP still degrades to a generic 4xx
+    # instead of the safety net becoming the LIVE path for a type someone forgot to map.
+    # This test makes that omission fail loudly instead of silently falling through.
+    assert _all_subclasses(ClientError) == set(app_module._UNIFORM_ERROR_MAP)
+
+
+def test_run_agent_given_generic_agent_error_returns_500(caplog: pytest.LogCaptureFixture):
+    caplog.set_level(logging.ERROR, logger="agent.api.app")
     client = _client_for(AgentError("something unexpected"))
 
     response = client.post("/v1/agents/researcher", json={"message": "hi"})
@@ -266,6 +322,8 @@ def test_run_agent_given_generic_agent_error_returns_500():
     assert detail["message"] == "An unexpected error occurred."
     assert "something unexpected" not in detail["message"]
     assert detail["request_id"]
+    [record] = [r for r in caplog.records if "unhandled AgentError" in r.message]
+    assert record.exception_type == "AgentError"
 
 
 def test_run_agent_given_missing_message_field_returns_400():
@@ -277,7 +335,8 @@ def test_run_agent_given_missing_message_field_returns_400():
     assert "param" in response.json()["detail"]
 
 
-def test_run_agent_given_unexpected_exception_returns_500():
+def test_run_agent_given_unexpected_exception_returns_500(caplog: pytest.LogCaptureFixture):
+    caplog.set_level(logging.ERROR, logger="agent.api.app")
     client = _client_for(RuntimeError("boom"))
 
     response = client.post("/v1/agents/researcher", json={"message": "hi"})
@@ -287,6 +346,8 @@ def test_run_agent_given_unexpected_exception_returns_500():
     assert detail["message"] == "An unexpected error occurred."
     assert "boom" not in detail["message"]
     assert detail["request_id"]
+    [record] = [r for r in caplog.records if "unhandled exception" in r.message]
+    assert record.exception_type == "RuntimeError"
 
 
 def test_run_agent_given_tool_calls_message_serializes_correctly():
@@ -495,3 +556,59 @@ def test_run_agent_given_guardrail_blocked_error_returns_422():
     detail = response.json()["detail"]
     assert detail["message"] == "blocked by guardrail 'no_profanity'"
     assert detail["code"] == "guardrail_blocked"
+
+
+async def test_run_agent_given_max_concurrent_requests_reached_returns_429():
+    started = asyncio.Event()
+    release = asyncio.Event()
+    app = FastAPI()
+    add_exception_handlers(app)
+    add_agent_run_route(app, _BlockingAgentRunService(started, release), max_concurrent_requests=1)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = asyncio.create_task(client.post("/v1/agents/researcher", json={"message": "hi"}))
+        await started.wait()
+
+        second = await client.post("/v1/agents/researcher", json={"message": "hi"})
+        release.set()
+        first_response = await first
+
+    assert second.status_code == 429
+    assert second.headers["Retry-After"] == "5"
+    assert second.json()["detail"]["code"] == "too_many_concurrent_requests"
+    assert first_response.status_code == 200
+
+
+async def test_run_agent_given_a_slot_frees_up_a_later_request_proceeds():
+    started = asyncio.Event()
+    release = asyncio.Event()
+    app = FastAPI()
+    add_exception_handlers(app)
+    add_agent_run_route(app, _BlockingAgentRunService(started, release), max_concurrent_requests=1)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = asyncio.create_task(client.post("/v1/agents/researcher", json={"message": "hi"}))
+        await started.wait()
+        release.set()
+        await first
+
+        started.clear()
+        release.clear()
+        second = asyncio.create_task(client.post("/v1/agents/researcher", json={"message": "hi"}))
+        await started.wait()
+        release.set()
+        second_response = await second
+
+    assert second_response.status_code == 200
+
+
+def test_run_agent_given_no_max_concurrent_requests_configured_stays_unbounded():
+    client = _client_for(_run())
+
+    response = client.post("/v1/agents/researcher", json={"message": "hi"})
+
+    assert response.status_code == 200

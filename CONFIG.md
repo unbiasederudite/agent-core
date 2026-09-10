@@ -18,7 +18,9 @@ root [README](README.md#running) for how `config.json` fits into running the pro
 | `compaction` | `null` | Compaction settings. Omitted disables compaction. |
 | `logging` | defaults below | Logging configuration. |
 | `session_store` | defaults below | Session-history storage settings. |
+| `tracing` | defaults below | Distributed tracing configuration. |
 | `max_sessions` | `null` | Cap on how many distinct sessions are kept at once. |
+| `max_concurrent_requests` | `null` | Cap on requests running at once across every agent and model combined. |
 
 ## `llms[]`
 
@@ -100,13 +102,19 @@ Optional — omit entirely to disable compaction.
 |---|---|---|
 | `level` | `"INFO"` | Minimum log level to emit: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`. |
 | `format` | `"text"` | Log output format: `text` or `json`. |
-| `console` | `true` | Whether to log to the console (stderr). |
-| `file` | `null` | Path to a log file, or `null` to skip file output. |
-| `file_max_bytes` | `null` | Rotate once the file reaches this size, in bytes. |
-| `file_backup_count` | `5` | Rotated backups to keep. Only relevant when `file_max_bytes` is set. |
 
 ## `session_store`
 
 | Field | Default | Description |
 |---|---|---|
 | `type` | `"in_memory"` | The session store's lookup key, matching a code-level implementation. |
+
+## `tracing`
+
+Every field is off by default — omit `tracing` entirely to keep the process untraced.
+
+| Field | Default | Description |
+|---|---|---|
+| `console` | `false` | Whether to export spans to the console as JSON Lines. |
+| `endpoint` | `null` | OTLP HTTP collector endpoint, or `null` to skip OTLP export. |
+| `capture_content` | `false` | Whether content text is attached to spans, not just metadata. |

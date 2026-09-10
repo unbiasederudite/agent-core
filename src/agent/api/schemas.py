@@ -75,11 +75,13 @@ class SessionUsageResponse(BaseModel):
     """Response body for GET /v1/agents/{agent_name}/sessions/{session_id}/usage."""
 
     session_id: str = Field(description="The session this usage belongs to.")
-    cumulative: Usage = Field(
-        description="Token and cost totals summed across every run against this session."
+    cumulative: Usage | None = Field(
+        description="Token and cost totals summed across every run against this session, "
+        "or None if this session's own usage record was evicted to bound memory."
     )
-    context_tokens: int = Field(
-        description="Token footprint of the full stored history as of the last run."
+    context_tokens: int | None = Field(
+        description="Token footprint of the full stored history as of the last run, "
+        "or None if this session's own footprint record was evicted to bound memory."
     )
 
 

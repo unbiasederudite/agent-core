@@ -10,6 +10,7 @@ from agent.core.models.config import (
     LoggingConfig,
     StrategyConfig,
     ToolConfig,
+    TracingConfig,
 )
 
 
@@ -519,14 +520,10 @@ def test_llm_config_given_max_delay_equal_to_base_delay_constructs():
     assert config.retry_max_delay == 5.0
 
 
-def test_logging_config_given_no_args_defaults_format_and_console_and_file():
+def test_logging_config_given_no_args_defaults_format():
     config = LoggingConfig()
 
     assert config.format == "text"
-    assert config.console is True
-    assert config.file is None
-    assert config.file_max_bytes is None
-    assert config.file_backup_count == 5
 
 
 def test_logging_config_given_json_format_constructs():
@@ -538,36 +535,6 @@ def test_logging_config_given_json_format_constructs():
 def test_logging_config_given_invalid_format_raises_validation_error():
     with pytest.raises(ValidationError):
         LoggingConfig(format="xml")
-
-
-def test_logging_config_given_file_without_max_bytes_constructs_uncapped():
-    config = LoggingConfig(file="/var/log/agent.log")
-
-    assert config.file == "/var/log/agent.log"
-    assert config.file_max_bytes is None
-
-
-def test_logging_config_given_file_and_max_bytes_constructs_rotating():
-    config = LoggingConfig(file="/var/log/agent.log", file_max_bytes=1_000_000, file_backup_count=3)
-
-    assert config.file_max_bytes == 1_000_000
-    assert config.file_backup_count == 3
-
-
-def test_logging_config_given_console_false_and_file_set_constructs():
-    config = LoggingConfig(console=False, file="/var/log/agent.log")
-
-    assert config.console is False
-
-
-def test_logging_config_given_console_false_and_no_file_raises_validation_error():
-    with pytest.raises(ValidationError):
-        LoggingConfig(console=False)
-
-
-def test_logging_config_given_zero_file_max_bytes_raises_validation_error():
-    with pytest.raises(ValidationError):
-        LoggingConfig(file="/var/log/agent.log", file_max_bytes=0)
 
 
 def test_app_config_given_no_max_sessions_defaults_to_unbounded():
@@ -585,6 +552,23 @@ def test_app_config_given_max_sessions_constructs():
 def test_app_config_given_zero_max_sessions_raises_validation_error():
     with pytest.raises(ValidationError):
         AppConfig(llms=[LLMConfig(model="openai/gpt-4o")], max_sessions=0)
+
+
+def test_app_config_given_no_max_concurrent_requests_defaults_to_unbounded():
+    config = AppConfig(llms=[LLMConfig(model="openai/gpt-4o")])
+
+    assert config.max_concurrent_requests is None
+
+
+def test_app_config_given_max_concurrent_requests_constructs():
+    config = AppConfig(llms=[LLMConfig(model="openai/gpt-4o")], max_concurrent_requests=20)
+
+    assert config.max_concurrent_requests == 20
+
+
+def test_app_config_given_zero_max_concurrent_requests_raises_validation_error():
+    with pytest.raises(ValidationError):
+        AppConfig(llms=[LLMConfig(model="openai/gpt-4o")], max_concurrent_requests=0)
 
 
 def test_app_config_given_unknown_field_raises_validation_error():
@@ -781,3 +765,29 @@ def test_app_config_guardrails_defaults_to_empty_list():
     config = AppConfig.model_validate({"llms": [{"model": "openai/gpt-4o"}]})
 
     assert config.guardrails == []
+
+
+def test_tracing_config_given_no_args_defaults_to_disabled():
+    config = TracingConfig()
+
+    assert config.console is False
+    assert config.endpoint is None
+    assert config.capture_content is False
+
+
+def test_tracing_config_given_endpoint_constructs():
+    config = TracingConfig(endpoint="http://localhost:4317")
+
+    assert config.endpoint == "http://localhost:4317"
+
+
+def test_tracing_config_given_unknown_field_raises_validation_error():
+    with pytest.raises(ValidationError):
+        TracingConfig.model_validate({"console": True, "bogus": "x"})
+
+
+def test_app_config_given_no_tracing_defaults_to_disabled():
+    config = AppConfig.model_validate({"llms": [{"model": "openai/gpt-4o"}]})
+
+    assert config.tracing.console is False
+    assert config.tracing.endpoint is None

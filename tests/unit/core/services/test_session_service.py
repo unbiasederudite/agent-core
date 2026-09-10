@@ -114,6 +114,7 @@ async def test_get_usage_returns_recorded_usage():
 
     cumulative, context_tokens = await service.get_usage("researcher", session_id)
 
+    assert cumulative is not None
     assert cumulative.total_tokens == 2
     assert cumulative.cost_usd == pytest.approx(0.01)
     assert context_tokens == 2
@@ -126,16 +127,16 @@ async def test_get_usage_given_unknown_session_raises_session_not_found_error():
         await service.get_usage("researcher", "does-not-exist")
 
 
-async def test_get_usage_given_session_with_no_recorded_usage_returns_zero_usage():
-    """Reachable when `max_sessions` LRU-evicts a `CostTracker` entry but not the session itself."""
+async def test_get_usage_given_session_with_no_recorded_usage_returns_none():
+    """Reachable for a session that exists but has never completed a run yet."""
     store = InMemorySessionStore()
     session_id = await store.create("researcher")
     service = SessionService(store)
 
     cumulative, context_tokens = await service.get_usage("researcher", session_id)
 
-    assert cumulative == Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0, cost_usd=None)
-    assert context_tokens == 0
+    assert cumulative is None
+    assert context_tokens is None
 
 
 async def test_get_usage_given_usage_recorded_but_no_context_footprint_defaults_footprint_only():
@@ -152,9 +153,10 @@ async def test_get_usage_given_usage_recorded_but_no_context_footprint_defaults_
 
     cumulative, context_tokens = await service.get_usage("researcher", session_id)
 
+    assert cumulative is not None
     assert cumulative.total_tokens == 2
     assert cumulative.cost_usd == pytest.approx(0.01)
-    assert context_tokens == 0
+    assert context_tokens is None
 
 
 async def test_get_usage_given_context_footprint_recorded_but_no_usage_defaults_usage_only():
@@ -167,7 +169,7 @@ async def test_get_usage_given_context_footprint_recorded_but_no_usage_defaults_
 
     cumulative, context_tokens = await service.get_usage("researcher", session_id)
 
-    assert cumulative == Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0, cost_usd=None)
+    assert cumulative is None
     assert context_tokens == 42
 
 

@@ -32,6 +32,22 @@ def test_main_given_config_arg_starts_uvicorn_with_default_host_and_port(
     assert kwargs["port"] == 8000
 
 
+def test_main_given_config_arg_passes_uvicorn_log_config_for_consistent_formatting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    mock_run = MagicMock()
+    monkeypatch.setattr("agent.api.__main__.uvicorn.run", mock_run)
+    config_path = _write_config(tmp_path)
+
+    main(["--config", str(config_path)])
+
+    _, kwargs = mock_run.call_args
+    log_config = kwargs["log_config"]
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        assert log_config["loggers"][logger_name]["handlers"] == []
+        assert log_config["loggers"][logger_name]["propagate"] is True
+
+
 def test_main_given_host_and_port_args_overrides_defaults(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

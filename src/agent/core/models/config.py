@@ -71,32 +71,6 @@ class LoggingConfig(BaseModel):
         default="INFO", description="Minimum log level to emit."
     )
     format: Literal["text", "json"] = Field(default="text", description="Log output format.")
-    console: bool = Field(default=True, description="Whether to log to the console (stderr).")
-    file: str | None = Field(
-        default=None, description="Path to a log file, or None to skip file output."
-    )
-    file_max_bytes: int | None = Field(
-        default=None, ge=1, description="Rotate once the file reaches this size, in bytes."
-    )
-    file_backup_count: int = Field(
-        default=5,
-        ge=0,
-        description="Rotated backups to keep. Only relevant when file_max_bytes is set.",
-    )
-
-    @model_validator(mode="after")
-    def _require_a_destination(self) -> "LoggingConfig":
-        """Reject console=False with no file set, since that produces zero log output.
-
-        Raises:
-            ValueError: if console is False and file is unset.
-        """
-        if not self.console and self.file is None:
-            raise ValueError(
-                "logging.console is False but logging.file is not set — "
-                "no log output would ever be produced"
-            )
-        return self
 
 
 class ToolConfig(BaseModel):
@@ -252,6 +226,21 @@ class SessionStoreConfig(BaseModel):
     )
 
 
+class TracingConfig(BaseModel):
+    """Distributed tracing configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    console: bool = Field(default=False, description="Whether to export spans to the console.")
+    endpoint: str | None = Field(
+        default=None, description="OTLP collector endpoint, or None to skip OTLP export."
+    )
+    capture_content: bool = Field(
+        default=False,
+        description="Whether content text is attached to spans, not just metadata.",
+    )
+
+
 class AppConfig(BaseModel):
     """Root startup configuration, loaded once from a JSON file."""
 
@@ -284,6 +273,14 @@ class AppConfig(BaseModel):
     session_store: SessionStoreConfig = Field(
         default_factory=SessionStoreConfig, description="Session-history storage settings."
     )
+    tracing: TracingConfig = Field(
+        default_factory=TracingConfig, description="Distributed tracing configuration."
+    )
     max_sessions: int | None = Field(
         default=None, ge=1, description="Cap on how many distinct sessions are kept at once."
+    )
+    max_concurrent_requests: int | None = Field(
+        default=None,
+        ge=1,
+        description="Cap on requests running at once across every agent and model combined.",
     )

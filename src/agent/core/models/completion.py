@@ -14,3 +14,11 @@ class Completion(BaseModel):
     finish_reason: str = Field(
         description='Why generation stopped (e.g. "stop", "length", "content_filter").'
     )
+    response_id: str | None = Field(
+        default=None, description="The provider's own identifier for this completion, if any."
+    )
+    response_model: str | None = Field(
+        default=None,
+        description="The exact model that generated this completion, if the provider reports "
+        "one distinct from the requested model.",
+    )

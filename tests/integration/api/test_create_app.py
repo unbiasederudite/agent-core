@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider as SDKTracerProvider
 
 from agent.api.app import create_app
 from agent.core.exceptions import ConfigError
@@ -76,6 +78,64 @@ def test_create_app_given_agent_serves_run_with_prepended_system_prompt(
 
     _, kwargs = mock_acompletion.call_args
     assert kwargs["messages"][0] == {"role": "system", "content": "You are a research assistant."}
+
+
+def test_create_app_given_tracing_disabled_shuts_down_without_raising(tmp_path: Path):
+    app = create_app(_agent_config_path(tmp_path))
+
+    with TestClient(app):
+        pass
+
+
+def test_create_app_given_tracing_enabled_uses_sdk_provider_and_shuts_down_without_raising(
+    tmp_path: Path,
+):
+    config_path = tmp_path / "app_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "llms": [{"model": "openai/gpt-4o"}],
+                "strategies": [{"name": "react"}],
+                "agents": [
+                    {
+                        "name": "researcher",
+                        "system_prompt": "You are a research assistant.",
+                        "model": "openai/gpt-4o",
+                        "strategy": "react",
+                    }
+                ],
+                "tracing": {"console": True},
+            }
+        )
+    )
+
+    app = create_app(config_path)
+
+    with TestClient(app):
+        assert isinstance(trace.get_tracer_provider(), SDKTracerProvider)
+
+
+def test_create_app_given_a_second_tracing_enabled_app_does_not_shut_down_the_first(
+    tmp_path: Path,
+):
+    # opentelemetry.trace.set_tracer_provider() silently no-ops on any call after the first
+    # in a process — a second create_app() with tracing enabled must not tear down the
+    # first app's still-registered provider when IT shuts down.
+    config_path = tmp_path / "app_config.json"
+    config_path.write_text(
+        json.dumps({"llms": [{"model": "openai/gpt-4o"}], "tracing": {"console": True}})
+    )
+
+    first_app = create_app(config_path)
+    with TestClient(first_app):
+        pass
+    registered_provider = trace.get_tracer_provider()
+
+    second_app = create_app(config_path)
+    with TestClient(second_app):
+        pass
+
+    assert trace.get_tracer_provider() is registered_provider
 
 
 def test_create_app_given_unknown_agent_returns_404(

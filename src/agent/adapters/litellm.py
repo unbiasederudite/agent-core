@@ -1,11 +1,13 @@
 """LLM adapter backed by litellm, giving access to any provider litellm supports."""
 
 import asyncio
+import json
 import logging
 import random
-from typing import Any
+from typing import Any, cast
 
 import litellm
+from opentelemetry import trace
 
 from agent.core.exceptions import (
     LLMContextWindowExceededError,
@@ -23,10 +25,22 @@ from agent.core.models.message import (
     flatten_tool_exchanges_for_no_tools_request,
 )
 from agent.core.models.usage import Usage
+from agent.core.tracing import (
+    capture_content_enabled,
+    record_gated_exception,
+    stamp_run_context,
+    truncate,
+    truncate_keeping_recent,
+)
 
 logger = logging.getLogger(__name__)
+tracer = trace.get_tracer(__name__)
+
+_MAX_MESSAGE_ATTRIBUTE_CHARS = 32_000
 
 litellm.telemetry = False
+litellm.verbose_logger.handlers.clear()  # type: ignore[attr-defined]
+litellm.verbose_logger.propagate = True  # type: ignore[attr-defined]
 
 
 def _first_not_none[T](a: T | None, b: T | None) -> T | None:
@@ -71,6 +85,90 @@ def _classify(exc: Exception, status_code: int | None) -> LLMError:
     return LLMError(str(exc))
 
 
+def _resolve_provider_name(model: str) -> str:
+    """Resolve `model`'s provider via litellm's own model-to-provider mapping.
+
+    Args:
+        model: The litellm model string.
+
+    Returns:
+        str: the resolved provider name, or "unknown" if resolution fails.
+    """
+    try:
+        return cast(str, litellm.get_llm_provider(model)[1])
+    except Exception:
+        return "unknown"
+
+
+def _message_parts(message: Message) -> list[dict[str, object]]:
+    """Map `message` to the GenAI semantic conventions' `parts` array shape.
+
+    Args:
+        message: The message to convert.
+
+    Returns:
+        list[dict[str, object]]: one part per content item, per the input/output messages
+            JSON schema.
+    """
+    if message.role == "tool":
+        return [
+            {
+                "type": "tool_call_response",
+                "id": message.tool_call_id,
+                "result": message.content,
+            }
+        ]
+    parts: list[dict[str, object]] = []
+    if message.content is not None:
+        parts.append({"type": "text", "content": message.content})
+    for call in message.tool_calls or []:
+        try:
+            arguments: object = json.loads(call.function.arguments)
+        except json.JSONDecodeError:
+            arguments = call.function.arguments
+        parts.append(
+            {
+                "type": "tool_call",
+                "id": call.id,
+                "name": call.function.name,
+                "arguments": arguments,
+            }
+        )
+    return parts
+
+
+def _to_gen_ai_message(message: Message) -> dict[str, object]:
+    """Map `message` to the GenAI semantic conventions' message-object shape.
+
+    Args:
+        message: The message to convert.
+
+    Returns:
+        dict[str, object]: `{"role": ..., "parts": [...]}`, per the input/output messages
+            JSON schema.
+    """
+    return {"role": message.role, "parts": _message_parts(message)}
+
+
+def _to_gen_ai_tool_definition(tool: dict[str, Any]) -> dict[str, object]:
+    """Map an OpenAI-format function schema to the GenAI tool-definition shape.
+
+    Args:
+        tool: An OpenAI-format `{"type": "function", "function": {...}}` tool schema.
+
+    Returns:
+        dict[str, object]: the same schema flattened to `{"type", "name", "description",
+            "parameters"}`, per the tool definitions JSON schema.
+    """
+    function = tool["function"]
+    return {
+        "type": tool["type"],
+        "name": function["name"],
+        "description": function["description"],
+        "parameters": function["parameters"],
+    }
+
+
 class LiteLLMAdapter:
     """Turns messages into a completion via litellm, supporting any litellm provider."""
 
@@ -104,6 +202,7 @@ class LiteLLMAdapter:
             max_concurrent_requests: Cap on concurrent in-flight calls to this model.
         """
         self._model = model
+        self._provider_name = _resolve_provider_name(model)
         self._temperature = temperature
         self._top_p = top_p
         self._max_tokens = max_tokens
@@ -166,28 +265,82 @@ class LiteLLMAdapter:
             LLMTimeoutError: if the request timed out.
             LLMError: if the call fails, or the response has neither content nor tool_calls.
         """
-        if self._max_concurrent is not None and self._in_flight >= self._max_concurrent:
-            logger.warning(
-                "model %s at capacity (%d/%d), rejecting",
-                self._model,
-                self._in_flight,
-                self._max_concurrent,
-                extra={
-                    "model": self._model,
-                    "in_flight": self._in_flight,
-                    "max_concurrent": self._max_concurrent,
-                },
-            )
-            raise LLMOverloadedError(
-                f"model '{self._model}' is at capacity ({self._max_concurrent} concurrent requests)"
-            )
-        self._in_flight += 1
-        try:
-            return await self._complete_with_retries(
-                messages, temperature, top_p, max_tokens, tools
-            )
-        finally:
-            self._in_flight -= 1
+        with tracer.start_as_current_span(
+            f"chat {self._model}",
+            kind=trace.SpanKind.CLIENT,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            span.set_attribute("gen_ai.operation.name", "chat")
+            span.set_attribute("gen_ai.request.model", self._model)
+            span.set_attribute("gen_ai.provider.name", self._provider_name)
+            stamp_run_context(span)
+            resolved_temperature = _first_not_none(temperature, self._temperature)
+            resolved_top_p = _first_not_none(top_p, self._top_p)
+            resolved_max_tokens = _first_not_none(max_tokens, self._max_tokens)
+            if resolved_temperature is not None:
+                span.set_attribute("gen_ai.request.temperature", resolved_temperature)
+            if resolved_top_p is not None:
+                span.set_attribute("gen_ai.request.top_p", resolved_top_p)
+            if resolved_max_tokens is not None:
+                span.set_attribute("gen_ai.request.max_tokens", resolved_max_tokens)
+            if capture_content_enabled():
+                span.set_attribute(
+                    "gen_ai.input.messages",
+                    truncate_keeping_recent(
+                        json.dumps([_to_gen_ai_message(m) for m in messages]),
+                        _MAX_MESSAGE_ATTRIBUTE_CHARS,
+                    ),
+                )
+                if tools:
+                    span.set_attribute(
+                        "gen_ai.tool.definitions",
+                        json.dumps([_to_gen_ai_tool_definition(t) for t in tools]),
+                    )
+            if self._max_concurrent is not None and self._in_flight >= self._max_concurrent:
+                logger.warning(
+                    "model %s at capacity (%d/%d), rejecting",
+                    self._model,
+                    self._in_flight,
+                    self._max_concurrent,
+                    extra={
+                        "model": self._model,
+                        "in_flight": self._in_flight,
+                        "max_concurrent": self._max_concurrent,
+                    },
+                )
+                error = LLMOverloadedError(
+                    f"model '{self._model}' is at capacity "
+                    f"({self._max_concurrent} concurrent requests)"
+                )
+                span.set_status(trace.Status(trace.StatusCode.ERROR, str(error)))
+                span.set_attribute("error.type", type(error).__name__)
+                raise error
+            self._in_flight += 1
+            try:
+                completion = await self._complete_with_retries(
+                    messages, resolved_temperature, resolved_top_p, resolved_max_tokens, tools
+                )
+            except Exception as exc:
+                record_gated_exception(span, exc)
+                raise
+            finally:
+                self._in_flight -= 1
+            span.set_attribute("gen_ai.usage.input_tokens", completion.usage.prompt_tokens)
+            span.set_attribute("gen_ai.usage.output_tokens", completion.usage.completion_tokens)
+            span.set_attribute("gen_ai.response.finish_reasons", (completion.finish_reason,))
+            if completion.response_id is not None:
+                span.set_attribute("gen_ai.response.id", completion.response_id)
+            if completion.response_model is not None:
+                span.set_attribute("gen_ai.response.model", completion.response_model)
+            if capture_content_enabled():
+                output_message = _to_gen_ai_message(completion.message)
+                output_message["finish_reason"] = completion.finish_reason
+                span.set_attribute(
+                    "gen_ai.output.messages",
+                    truncate(json.dumps([output_message]), _MAX_MESSAGE_ATTRIBUTE_CHARS),
+                )
+            return completion
 
     async def _complete_with_retries(
         self,
@@ -201,9 +354,9 @@ class LiteLLMAdapter:
 
         Args:
             messages: Conversation history to send.
-            temperature: Temperature override for this call.
-            top_p: Top-p override for this call.
-            max_tokens: Max-tokens override for this call.
+            temperature: Resolved sampling temperature for this call, if any.
+            top_p: Resolved nucleus sampling value for this call, if any.
+            max_tokens: Resolved max output tokens for this call, if any.
             tools: OpenAI-format function schemas to offer the model.
 
         Returns:
@@ -214,16 +367,12 @@ class LiteLLMAdapter:
             LLMTimeoutError: if the request timed out.
             LLMError: if the call fails, or the response has neither content nor tool_calls.
         """
-        resolved_temperature = _first_not_none(temperature, self._temperature)
-        resolved_top_p = _first_not_none(top_p, self._top_p)
-        resolved_max_tokens = _first_not_none(max_tokens, self._max_tokens)
-
         params: dict[str, Any] = {
             key: value
             for key, value in (
-                ("temperature", resolved_temperature),
-                ("top_p", resolved_top_p),
-                ("max_completion_tokens", resolved_max_tokens),
+                ("temperature", temperature),
+                ("top_p", top_p),
+                ("max_completion_tokens", max_tokens),
                 ("timeout", self._timeout),
             )
             if value is not None
@@ -248,17 +397,18 @@ class LiteLLMAdapter:
                 status_code = getattr(exc, "status_code", None)
                 classified = _classify(exc, status_code)
                 retriable = status_code in (429, 408) or _is_retriable(status_code)
+                extra = {
+                    "exception_type": type(exc).__name__,
+                    "status_code": status_code,
+                    "attempt": attempt + 1,
+                }
                 if not retriable or attempt == self._num_retries:
-                    logger.error(
+                    logger.warning(
                         "LLM call failed permanently: %s (status=%s)",
                         type(exc).__name__,
                         status_code,
                         exc_info=True,
-                        extra={
-                            "exception_type": type(exc).__name__,
-                            "status_code": status_code,
-                            "attempt": attempt + 1,
-                        },
+                        extra=extra,
                     )
                     raise classified from exc
                 delay = min(
@@ -273,11 +423,7 @@ class LiteLLMAdapter:
                     self._num_retries + 1,
                     delay,
                     exc,
-                    extra={
-                        "exception_type": type(exc).__name__,
-                        "status_code": status_code,
-                        "attempt": attempt + 1,
-                    },
+                    extra=extra,
                 )
                 await asyncio.sleep(delay)
                 continue
@@ -318,9 +464,11 @@ class LiteLLMAdapter:
                         cost_usd=cost_usd,
                     ),
                     finish_reason=choice.finish_reason,
+                    response_id=getattr(response, "id", None),
+                    response_model=getattr(response, "model", None),
                 )
             except LLMError as malformed:
-                logger.error(
+                logger.warning(
                     "provider returned a malformed response: %s",
                     malformed,
                     exc_info=True,
@@ -329,7 +477,7 @@ class LiteLLMAdapter:
                 raise
             except (IndexError, AttributeError, KeyError, TypeError) as exc:
                 shape_error = LLMError(f"litellm returned an unexpected response shape: {exc}")
-                logger.error(
+                logger.warning(
                     "provider returned a malformed response: %s",
                     shape_error,
                     exc_info=True,

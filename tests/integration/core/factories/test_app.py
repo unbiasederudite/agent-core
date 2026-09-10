@@ -47,7 +47,7 @@ def test_build_given_valid_config_registers_llm():
         base_prompt,
         compaction_config,
         logging_config,
-        max_sessions,
+        tracing_config,
     ) = build_registries(config)
 
     assert llm_registry.get("openai/gpt-4o") is not None
@@ -58,6 +58,7 @@ def test_build_given_valid_config_registers_llm():
     assert base_prompt is None
     assert compaction_config is None
     assert logging_config.level == "INFO"
+    assert tracing_config.console is False
 
 
 def test_build_given_base_prompt_returns_it():
@@ -241,11 +242,24 @@ def test_build_given_unknown_session_store_type_raises_config_error():
 def test_build_given_max_sessions_passes_it_to_session_store():
     config = AppConfig.model_validate({"llms": [{"model": "openai/gpt-4o"}], "max_sessions": 5})
 
-    _, _, _, _, _, session_store, _, _, _, max_sessions = build_registries(config)
+    _, _, _, _, _, session_store, _, _, _, _ = build_registries(config)
 
     assert isinstance(session_store, InMemorySessionStore)
     assert session_store._max_sessions == 5  # verifying factory wiring
-    assert max_sessions == 5
+
+
+def test_build_given_on_session_evict_passes_it_to_session_store():
+    config = AppConfig.model_validate({"llms": [{"model": "openai/gpt-4o"}]})
+    evicted: list[tuple[str, str]] = []
+
+    _, _, _, _, _, session_store, _, _, _, _ = build_registries(
+        config, on_session_evict=lambda agent, sid: evicted.append((agent, sid))
+    )
+
+    assert isinstance(session_store, InMemorySessionStore)
+    assert session_store._on_evict is not None  # verifying factory wiring
+    session_store._on_evict("researcher", "sess-1")
+    assert evicted == [("researcher", "sess-1")]
 
 
 def test_build_given_duplicate_strategy_name_raises_config_error():
@@ -423,22 +437,6 @@ def test_build_given_no_logging_block_returns_defaults():
 
     assert logging_config.level == "INFO"
     assert logging_config.format == "text"
-
-
-def test_build_given_max_sessions_returns_it():
-    config = AppConfig.model_validate({"llms": [{"model": "openai/gpt-4o"}], "max_sessions": 100})
-
-    *_, max_sessions = build_registries(config)
-
-    assert max_sessions == 100
-
-
-def test_build_given_no_max_sessions_returns_none():
-    config = AppConfig.model_validate({"llms": [{"model": "openai/gpt-4o"}]})
-
-    *_, max_sessions = build_registries(config)
-
-    assert max_sessions is None
 
 
 def test_build_given_agent_allowed_tools_references_unknown_tool_raises_config_error():

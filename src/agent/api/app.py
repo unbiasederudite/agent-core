@@ -1,11 +1,15 @@
 """FastAPI application for the backend-native agent API."""
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider as SDKTracerProvider
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -28,6 +32,7 @@ from agent.api.schemas import (
 from agent.core.exceptions import (
     AgentError,
     AgentNotFoundError,
+    ClientError,
     CompactionExhaustedError,
     ConfigError,
     GuardrailBlockedError,
@@ -48,7 +53,7 @@ from agent.core.exceptions import (
     ToolNotAllowedError,
     ToolNotFoundError,
 )
-from agent.core.factories.app import build_registries
+from agent.core.factories.app import build_registries, configure_tracing
 from agent.core.models.config import AppConfig
 from agent.core.registries.agent import AgentRegistry
 from agent.core.registries.llm import LLMRegistry
@@ -140,7 +145,12 @@ def add_exception_handlers(app: FastAPI) -> None:
         Returns:
             JSONResponse: 500 with a fixed message and the current request id.
         """
-        logger.error("unhandled exception: %s", exc, exc_info=True)
+        logger.error(
+            "unhandled exception: %s",
+            exc,
+            exc_info=True,
+            extra={"exception_type": type(exc).__name__},
+        )
         return JSONResponse(
             status_code=500,
             content={
@@ -149,16 +159,61 @@ def add_exception_handlers(app: FastAPI) -> None:
         )
 
 
-def add_agent_run_route(app: FastAPI, agent_run_service: AgentRunService) -> None:
+class _ConcurrencyLimiter:
+    """Rejects a request immediately once `max_in_flight` are already running."""
+
+    def __init__(self, max_in_flight: int | None) -> None:
+        """Initialize with a fixed capacity.
+
+        Args:
+            max_in_flight: Maximum number of requests allowed to hold a slot at once.
+                `None` leaves this limiter unbounded.
+        """
+        self._max_in_flight = max_in_flight
+        self._in_flight = 0
+
+    @asynccontextmanager
+    async def slot(self) -> AsyncIterator[None]:
+        """Hold one slot for the duration of the `with` block.
+
+        Yields:
+            None: for as long as this request holds its slot.
+
+        Raises:
+            HTTPException: 429, if already at capacity.
+        """
+        if self._max_in_flight is not None and self._in_flight >= self._max_in_flight:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "message": "Too many concurrent requests. Please try again shortly.",
+                    "code": "too_many_concurrent_requests",
+                },
+                headers={"Retry-After": _RETRY_AFTER_SECONDS},
+            )
+        self._in_flight += 1
+        try:
+            yield
+        finally:
+            self._in_flight -= 1
+
+
+def add_agent_run_route(
+    app: FastAPI,
+    agent_run_service: AgentRunService,
+    max_concurrent_requests: int | None = None,
+) -> None:
     """Register POST /v1/agents/{agent_name} on `app`, backed by `agent_run_service`.
 
     Args:
         app: FastAPI app to register the route on.
         agent_run_service: Service backing the route.
+        max_concurrent_requests: Cap on requests running at once across every agent and
+            model combined. `None` leaves this route unbounded.
     """
+    limiter = _ConcurrencyLimiter(max_concurrent_requests)
 
-    @app.post("/v1/agents/{agent_name}")
-    async def run_agent(agent_name: str, request: AgentRunRequest) -> AgentRunResponse:
+    async def _run(agent_name: str, request: AgentRunRequest) -> AgentRunResponse:
         try:
             run = await agent_run_service.run(
                 request.message,
@@ -230,8 +285,15 @@ def add_agent_run_route(app: FastAPI, agent_run_service: AgentRunService) -> Non
                     "request_id": current_request_id(),
                 },
             ) from exc
+        except ClientError as exc:
+            raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
         except AgentError as exc:
-            logger.error("unhandled AgentError subtype: %s", exc, exc_info=True)
+            logger.error(
+                "unhandled AgentError subtype: %s",
+                exc,
+                exc_info=True,
+                extra={"exception_type": type(exc).__name__},
+            )
             raise HTTPException(
                 status_code=500,
                 detail={"message": INTERNAL_ERROR_MESSAGE, "request_id": current_request_id()},
@@ -245,6 +307,11 @@ def add_agent_run_route(app: FastAPI, agent_run_service: AgentRunService) -> Non
             finish_reason=run.finish_reason,
             session_id=run.session_id,
         )
+
+    @app.post("/v1/agents/{agent_name}")
+    async def run_agent(agent_name: str, request: AgentRunRequest) -> AgentRunResponse:
+        async with limiter.slot():
+            return await _run(agent_name, request)
 
 
 def add_registry_routes(
@@ -384,6 +451,22 @@ def add_usage_routes(
         return AgentUsageResponse(agent=agent_name, cumulative=cost_tracker.agent_usage(agent_name))
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Flush and shut down tracing on app shutdown.
+
+    Args:
+        app: The FastAPI app this lifespan is attached to.
+
+    Yields:
+        None: control returns to FastAPI for the app's running lifetime.
+    """
+    yield
+    provider = getattr(app.state, "tracer_provider", None)
+    if isinstance(provider, SDKTracerProvider) and trace.get_tracer_provider() is provider:
+        provider.shutdown()
+
+
 def create_app(config_path: Path) -> FastAPI:
     """Build the FastAPI app, wired from the startup configuration JSON at `config_path`.
 
@@ -401,6 +484,14 @@ def create_app(config_path: Path) -> FastAPI:
     except (OSError, ValidationError) as exc:
         raise ConfigError(str(exc)) from exc
 
+    cost_tracker = CostTracker()
+    context_tracker = ContextFootprintTracker()
+
+    def _on_session_evict(agent: str, session_id: str) -> None:
+        """Keep usage/footprint tracking from outliving the session they describe."""
+        cost_tracker.forget(agent, session_id)
+        context_tracker.forget(agent, session_id)
+
     (
         llm_registry,
         agent_registry,
@@ -411,11 +502,10 @@ def create_app(config_path: Path) -> FastAPI:
         base_prompt,
         compaction_config,
         logging_config,
-        max_sessions,
-    ) = build_registries(config)
+        tracing_config,
+    ) = build_registries(config, on_session_evict=_on_session_evict)
     configure_logging(logging_config, RequestIdFilter(), RunContextFilter())
-    cost_tracker = CostTracker(max_sessions=max_sessions)
-    context_tracker = ContextFootprintTracker(max_sessions=max_sessions)
+    tracer_provider = configure_tracing(tracing_config)
     compaction_service = (
         CompactionService(llm_registry, session_store, compaction_config, context_tracker)
         if compaction_config is not None
@@ -437,10 +527,13 @@ def create_app(config_path: Path) -> FastAPI:
         session_store, cost_tracker=cost_tracker, context_tracker=context_tracker
     )
 
-    app = FastAPI()
+    app = FastAPI(lifespan=_lifespan)
+    app.state.tracer_provider = tracer_provider
     app.add_middleware(RequestIdMiddleware)
     add_exception_handlers(app)
-    add_agent_run_route(app, agent_run_service)
+    add_agent_run_route(
+        app, agent_run_service, max_concurrent_requests=config.max_concurrent_requests
+    )
     add_registry_routes(app, agent_registry, tool_registry, llm_registry, strategy_registry)
     add_health_route(app)
     add_session_routes(app, session_service)

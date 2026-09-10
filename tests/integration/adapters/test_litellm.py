@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from types import SimpleNamespace
 from typing import Any
@@ -6,7 +7,12 @@ from unittest.mock import AsyncMock, Mock
 
 import litellm
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind, StatusCode
 
+from agent.adapters import litellm as litellm_adapter
 from agent.adapters.litellm import LiteLLMAdapter
 from agent.core.exceptions import (
     LLMContextWindowExceededError,
@@ -17,6 +23,13 @@ from agent.core.exceptions import (
 )
 from agent.core.models.config import LLMConfig
 from agent.core.models.message import Message, ToolCall, ToolCallFunction
+from agent.core.run_context import run_context
+from agent.core.tracing import set_capture_content
+
+
+def test_module_import_clears_litellm_verbose_logger_handler_and_enables_propagation():
+    assert litellm.verbose_logger.handlers == []  # type: ignore[attr-defined]
+    assert litellm.verbose_logger.propagate is True  # type: ignore[attr-defined]
 
 
 class _FakeProviderError(Exception):
@@ -27,6 +40,8 @@ class _FakeProviderError(Exception):
 
 def _fake_litellm_response(finish_reason: str = "stop") -> SimpleNamespace:
     return SimpleNamespace(
+        id="chatcmpl-test123",
+        model="gpt-4o-0613",
         choices=[
             SimpleNamespace(message=SimpleNamespace(content="hello!"), finish_reason=finish_reason)
         ],
@@ -116,6 +131,343 @@ async def test_complete_given_successful_response_returns_completion(
     assert completion.message.content == "hello!"
     assert completion.usage.total_tokens == 15
     assert completion.finish_reason == "stop"
+
+
+async def test_complete_opens_a_chat_span_with_usage_and_operation_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(litellm_adapter, "tracer", provider.get_tracer("test"))
+    monkeypatch.setattr("litellm.acompletion", AsyncMock(return_value=_fake_litellm_response()))
+    adapter = LiteLLMAdapter(model="openai/gpt-4o")
+
+    await adapter.complete([Message(role="user", content="hi")])
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "chat openai/gpt-4o"]
+    assert span.kind == SpanKind.CLIENT
+    assert span.attributes["gen_ai.operation.name"] == "chat"
+    assert span.attributes["gen_ai.request.model"] == "openai/gpt-4o"
+    assert span.attributes["gen_ai.usage.input_tokens"] == 10
+    assert span.attributes["gen_ai.usage.output_tokens"] == 5
+    assert span.attributes["gen_ai.response.finish_reasons"] == ("stop",)
+    assert span.attributes["gen_ai.response.id"] == "chatcmpl-test123"
+    assert span.attributes["gen_ai.response.model"] == "gpt-4o-0613"
+
+
+async def test_complete_given_sampling_params_chat_span_has_request_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(litellm_adapter, "tracer", provider.get_tracer("test"))
+    monkeypatch.setattr("litellm.acompletion", AsyncMock(return_value=_fake_litellm_response()))
+    adapter = LiteLLMAdapter(model="openai/gpt-4o")
+
+    await adapter.complete(
+        [Message(role="user", content="hi")], temperature=0.5, top_p=0.9, max_tokens=100
+    )
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "chat openai/gpt-4o"]
+    assert span.attributes["gen_ai.request.temperature"] == 0.5
+    assert span.attributes["gen_ai.request.top_p"] == 0.9
+    assert span.attributes["gen_ai.request.max_tokens"] == 100
+
+
+async def test_complete_given_no_sampling_params_chat_span_omits_request_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(litellm_adapter, "tracer", provider.get_tracer("test"))
+    monkeypatch.setattr("litellm.acompletion", AsyncMock(return_value=_fake_litellm_response()))
+    adapter = LiteLLMAdapter(model="openai/gpt-4o")
+
+    await adapter.complete([Message(role="user", content="hi")])
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "chat openai/gpt-4o"]
+    assert "gen_ai.request.temperature" not in span.attributes
+    assert "gen_ai.request.top_p" not in span.attributes
+    assert "gen_ai.request.max_tokens" not in span.attributes
+
+
+async def test_complete_given_capture_content_disabled_chat_span_has_no_message_content(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(litellm_adapter, "tracer", provider.get_tracer("test"))
+    set_capture_content(False)
+    monkeypatch.setattr("litellm.acompletion", AsyncMock(return_value=_fake_litellm_response()))
+    adapter = LiteLLMAdapter(model="openai/gpt-4o")
+
+    await adapter.complete([Message(role="user", content="hi")])
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "chat openai/gpt-4o"]
+    assert not any("content" in key for key in span.attributes)
+
+
+async def test_complete_given_capture_content_enabled_chat_span_has_output_content(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(litellm_adapter, "tracer", provider.get_tracer("test"))
+    set_capture_content(True)
+    try:
+        monkeypatch.setattr("litellm.acompletion", AsyncMock(return_value=_fake_litellm_response()))
+        adapter = LiteLLMAdapter(model="openai/gpt-4o")
+
+        await adapter.complete([Message(role="user", content="hi")])
+
+        [span] = [s for s in exporter.get_finished_spans() if s.name == "chat openai/gpt-4o"]
+        assert json.loads(span.attributes["gen_ai.output.messages"]) == [
+            {
+                "role": "assistant",
+                "parts": [{"type": "text", "content": "hello!"}],
+                "finish_reason": "stop",
+            }
+        ]
+    finally:
+        set_capture_content(False)
+
+
+async def test_complete_given_capture_content_enabled_chat_span_has_input_messages(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(litellm_adapter, "tracer", provider.get_tracer("test"))
+    set_capture_content(True)
+    try:
+        monkeypatch.setattr("litellm.acompletion", AsyncMock(return_value=_fake_litellm_response()))
+        adapter = LiteLLMAdapter(model="openai/gpt-4o")
+
+        await adapter.complete(_tool_exchange_history())
+
+        [span] = [s for s in exporter.get_finished_spans() if s.name == "chat openai/gpt-4o"]
+        assert json.loads(span.attributes["gen_ai.input.messages"]) == [
+            {"role": "user", "parts": [{"type": "text", "content": "what time is it?"}]},
+            {
+                "role": "assistant",
+                "parts": [
+                    {
+                        "type": "tool_call",
+                        "id": "call_1",
+                        "name": "get_current_time",
+                        "arguments": {},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "parts": [{"type": "tool_call_response", "id": "call_1", "result": "12:00"}],
+            },
+            {"role": "assistant", "parts": [{"type": "text", "content": "it is noon"}]},
+        ]
+    finally:
+        set_capture_content(False)
+
+
+async def test_complete_given_oversized_history_input_messages_keeps_the_most_recent_part(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(litellm_adapter, "tracer", provider.get_tracer("test"))
+    monkeypatch.setattr(litellm_adapter, "_MAX_MESSAGE_ATTRIBUTE_CHARS", 40)
+    set_capture_content(True)
+    try:
+        monkeypatch.setattr("litellm.acompletion", AsyncMock(return_value=_fake_litellm_response()))
+        adapter = LiteLLMAdapter(model="openai/gpt-4o")
+
+        await adapter.complete([Message(role="user", content=f"message {i}") for i in range(20)])
+
+        [span] = [s for s in exporter.get_finished_spans() if s.name == "chat openai/gpt-4o"]
+        input_messages = span.attributes["gen_ai.input.messages"]
+        assert "earlier characters" in input_messages
+        assert "message 19" in input_messages
+        assert "message 0" not in input_messages
+    finally:
+        set_capture_content(False)
+
+
+async def test_complete_given_capture_content_enabled_and_tools_chat_span_has_tool_definitions(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(litellm_adapter, "tracer", provider.get_tracer("test"))
+    set_capture_content(True)
+    try:
+        monkeypatch.setattr("litellm.acompletion", AsyncMock(return_value=_fake_litellm_response()))
+        adapter = LiteLLMAdapter(model="openai/gpt-4o")
+        tool_schema = {
+            "type": "function",
+            "function": {
+                "name": "get_current_time",
+                "description": "Get the current time.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+
+        await adapter.complete([Message(role="user", content="hi")], tools=[tool_schema])
+
+        [span] = [s for s in exporter.get_finished_spans() if s.name == "chat openai/gpt-4o"]
+        assert json.loads(span.attributes["gen_ai.tool.definitions"]) == [
+            {
+                "type": "function",
+                "name": "get_current_time",
+                "description": "Get the current time.",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+    finally:
+        set_capture_content(False)
+
+
+async def test_complete_given_capture_content_enabled_and_no_tools_chat_span_omits_tool_definitions(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(litellm_adapter, "tracer", provider.get_tracer("test"))
+    set_capture_content(True)
+    try:
+        monkeypatch.setattr("litellm.acompletion", AsyncMock(return_value=_fake_litellm_response()))
+        adapter = LiteLLMAdapter(model="openai/gpt-4o")
+
+        await adapter.complete([Message(role="user", content="hi")])
+
+        [span] = [s for s in exporter.get_finished_spans() if s.name == "chat openai/gpt-4o"]
+        assert "gen_ai.tool.definitions" not in span.attributes
+    finally:
+        set_capture_content(False)
+
+
+async def test_complete_given_concurrency_cap_reached_chat_span_records_the_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(litellm_adapter, "tracer", provider.get_tracer("test"))
+    adapter = LiteLLMAdapter(model="openai/gpt-4o", max_concurrent_requests=1)
+    adapter._in_flight = 1
+
+    with pytest.raises(LLMOverloadedError):
+        await adapter.complete([Message(role="user", content="hi")])
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "chat openai/gpt-4o"]
+    assert span.status.status_code == StatusCode.ERROR
+    assert span.attributes["error.type"] == "LLMOverloadedError"
+
+
+async def test_complete_given_provider_error_chat_span_omits_description_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # str(exc) here can carry provider-echoed request content (a classified LLMError wraps the
+    # raw provider error), so it's gated like gen_ai content elsewhere on this same span —
+    # error.type alone (already content-free) identifies the failure by default. The span must
+    # also disable record_exception/set_status_on_exception defaults, or OTel's own SDK would
+    # auto-record the raw message on span exit regardless of this gate.
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(litellm_adapter, "tracer", provider.get_tracer("test"))
+    monkeypatch.setattr("litellm.acompletion", AsyncMock(side_effect=RuntimeError("provider down")))
+    adapter = LiteLLMAdapter(model="openai/gpt-4o", num_retries=0)
+
+    with pytest.raises(LLMError):
+        await adapter.complete([Message(role="user", content="hi")])
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "chat openai/gpt-4o"]
+    assert span.attributes["error.type"] == "LLMError"
+    assert span.status.status_code == StatusCode.ERROR
+    assert span.status.description is None
+    assert len(span.events) == 0
+
+
+async def test_complete_given_provider_error_chat_span_records_it_when_capturing_content(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(litellm_adapter, "tracer", provider.get_tracer("test"))
+    monkeypatch.setattr("litellm.acompletion", AsyncMock(side_effect=RuntimeError("provider down")))
+    adapter = LiteLLMAdapter(model="openai/gpt-4o", num_retries=0)
+    set_capture_content(True)
+    try:
+        with pytest.raises(LLMError):
+            await adapter.complete([Message(role="user", content="hi")])
+    finally:
+        set_capture_content(False)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "chat openai/gpt-4o"]
+    assert span.attributes["error.type"] == "LLMError"
+    assert span.status.status_code == StatusCode.ERROR
+    assert span.status.description is not None
+    assert "provider down" in span.status.description
+    assert len(span.events) == 1
+
+
+async def test_complete_opens_a_chat_span_with_provider_name(monkeypatch: pytest.MonkeyPatch):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(litellm_adapter, "tracer", provider.get_tracer("test"))
+    monkeypatch.setattr("litellm.acompletion", AsyncMock(return_value=_fake_litellm_response()))
+    adapter = LiteLLMAdapter(model="openai/gpt-4o")
+
+    await adapter.complete([Message(role="user", content="hi")])
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "chat openai/gpt-4o"]
+    assert span.attributes["gen_ai.provider.name"] == "openai"
+
+
+async def test_complete_given_active_run_context_chat_span_has_conversation_id(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(litellm_adapter, "tracer", provider.get_tracer("test"))
+    monkeypatch.setattr("litellm.acompletion", AsyncMock(return_value=_fake_litellm_response()))
+    adapter = LiteLLMAdapter(model="openai/gpt-4o")
+
+    with run_context("researcher", "sess-1"):
+        await adapter.complete([Message(role="user", content="hi")])
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "chat openai/gpt-4o"]
+    assert span.attributes["gen_ai.conversation.id"] == "sess-1"
+    assert span.attributes["gen_ai.agent.name"] == "researcher"
+
+
+async def test_complete_given_no_active_run_chat_span_has_no_conversation_id(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(litellm_adapter, "tracer", provider.get_tracer("test"))
+    monkeypatch.setattr("litellm.acompletion", AsyncMock(return_value=_fake_litellm_response()))
+    adapter = LiteLLMAdapter(model="openai/gpt-4o")
+
+    await adapter.complete([Message(role="user", content="hi")])
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "chat openai/gpt-4o"]
+    assert "gen_ai.conversation.id" not in span.attributes
+    assert "gen_ai.agent.name" not in span.attributes
 
 
 async def test_complete_given_length_finish_reason_is_not_hardcoded_to_stop(
@@ -839,11 +1191,13 @@ async def test_complete_given_retry_logs_warning_with_structured_exception_field
     assert record.attempt == 1
 
 
-async def test_complete_given_exhausted_retries_logs_error_with_traceback(
+async def test_complete_given_exhausted_retries_logs_warning_with_traceback(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ):
-    caplog.set_level(logging.ERROR, logger="agent.adapters.litellm")
+    # WARN, not ERROR: per OTel's exception-recording guidance, a CLIENT-kind span's
+    # exceptions (the whole call happens inside the `chat` span) are WARN severity.
+    caplog.set_level(logging.WARNING, logger="agent.adapters.litellm")
     mock_acompletion = AsyncMock(side_effect=_FakeProviderError("rate limited", status_code=429))
     monkeypatch.setattr("litellm.acompletion", mock_acompletion)
     monkeypatch.setattr("agent.adapters.litellm.asyncio.sleep", AsyncMock())
@@ -852,7 +1206,7 @@ async def test_complete_given_exhausted_retries_logs_error_with_traceback(
     with pytest.raises(LLMRateLimitedError):
         await adapter.complete([Message(role="user", content="hi")])
 
-    [record] = [r for r in caplog.records if r.levelno == logging.ERROR]
+    [record] = [r for r in caplog.records if r.levelno == logging.WARNING and r.exc_info]
     assert record.exc_info is not None
     assert record.status_code == 429
 

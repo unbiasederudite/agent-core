@@ -1,13 +1,10 @@
-"""Tests for api/logging_setup.py's configure_logging(): handler construction and rotation."""
+"""Tests for api/logging_setup.py's configure_logging(): handler construction."""
 
 import logging
-import logging.handlers
-from pathlib import Path
 
 import pytest
 
 from agent.api.logging_setup import JsonFormatter, configure_logging
-from agent.core.exceptions import ConfigError
 from agent.core.models.config import LoggingConfig
 
 
@@ -46,64 +43,21 @@ def test_configure_logging_given_json_format_uses_json_formatter():
     assert isinstance(root_handler.formatter, JsonFormatter)
 
 
-def test_configure_logging_given_file_without_max_bytes_creates_plain_file_handler(
-    tmp_path: Path,
-):
-    configure_logging(LoggingConfig(file=str(tmp_path / "agent.log")), _NullFilter())
-
-    file_handlers = [h for h in logging.getLogger().handlers if isinstance(h, logging.FileHandler)]
-    assert len(file_handlers) == 1
-    assert not isinstance(file_handlers[0], logging.handlers.RotatingFileHandler)
-
-
-def test_configure_logging_given_file_max_bytes_creates_rotating_file_handler(tmp_path: Path):
-    configure_logging(
-        LoggingConfig(file=str(tmp_path / "agent.log"), file_max_bytes=1000, file_backup_count=2),
-        _NullFilter(),
-    )
-
-    [handler] = [
-        h
-        for h in logging.getLogger().handlers
-        if isinstance(h, logging.handlers.RotatingFileHandler)
-    ]
-    assert handler.maxBytes == 1000
-    assert handler.backupCount == 2
-
-
-def test_configure_logging_given_console_true_and_file_produces_both_handlers(tmp_path: Path):
-    configure_logging(LoggingConfig(console=True, file=str(tmp_path / "agent.log")), _NullFilter())
-
-    handlers = logging.getLogger().handlers
-    assert any(isinstance(h, logging.FileHandler) for h in handlers)
-    assert any(
-        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
-        for h in handlers
-    )
-
-
-def test_configure_logging_given_console_false_produces_only_file_handler(tmp_path: Path):
-    configure_logging(LoggingConfig(console=False, file=str(tmp_path / "agent.log")), _NullFilter())
+def test_configure_logging_always_produces_one_stream_handler():
+    configure_logging(LoggingConfig(), _NullFilter())
 
     handlers = logging.getLogger().handlers
     assert len(handlers) == 1
-    assert isinstance(handlers[0], logging.FileHandler)
+    assert isinstance(handlers[0], logging.StreamHandler)
 
 
-def test_configure_logging_given_bad_file_path_raises_config_error(tmp_path: Path):
-    bad_path = tmp_path / "does" / "not" / "exist" / "agent.log"
-
-    with pytest.raises(ConfigError):
-        configure_logging(LoggingConfig(file=str(bad_path)), _NullFilter())
-
-
-def test_configure_logging_called_twice_does_not_accumulate_handlers(tmp_path: Path):
-    config = LoggingConfig(console=True, file=str(tmp_path / "agent.log"))
+def test_configure_logging_called_twice_does_not_accumulate_handlers():
+    config = LoggingConfig()
 
     configure_logging(config, _NullFilter())
     configure_logging(config, _NullFilter())
 
-    assert len(logging.getLogger().handlers) == 2  # not 4
+    assert len(logging.getLogger().handlers) == 1  # not 2
 
 
 def test_configure_logging_given_multiple_filters_attaches_all_to_every_handler():

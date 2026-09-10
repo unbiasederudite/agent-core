@@ -291,6 +291,29 @@ async def test_given_over_max_sessions_evicts_the_least_recently_touched():
     assert await store.get("researcher", third_id) == []
 
 
+async def test_given_over_max_sessions_calls_on_evict_with_the_evicted_key():
+    evicted: list[tuple[str, str]] = []
+    store = InMemorySessionStore(
+        max_sessions=2, on_evict=lambda agent, sid: evicted.append((agent, sid))
+    )
+    first_id = await store.create("researcher")
+    await store.create("researcher")
+
+    await store.create("researcher")
+
+    assert evicted == [("researcher", first_id)]
+
+
+async def test_given_no_on_evict_eviction_still_proceeds():
+    store = InMemorySessionStore(max_sessions=1)
+    first_id = await store.create("researcher")
+
+    await store.create("researcher")
+
+    with pytest.raises(SessionNotFoundError):
+        await store.get("researcher", first_id)
+
+
 async def test_touching_a_session_protects_it_from_the_next_eviction():
     store = InMemorySessionStore(max_sessions=2)
     first_id = await store.create("researcher")

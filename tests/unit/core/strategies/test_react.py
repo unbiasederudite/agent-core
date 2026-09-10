@@ -6,6 +6,10 @@ import logging
 from typing import Any
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from agent.core.models.completion import Completion
@@ -13,7 +17,10 @@ from agent.core.models.guardrail import GuardrailFinding
 from agent.core.models.message import Message, ToolCall, ToolCallFunction
 from agent.core.models.usage import Usage
 from agent.core.protocols.itool import ITool
+from agent.core.run_context import run_context
+from agent.core.strategies import react
 from agent.core.strategies.react import ReactStrategy
+from agent.core.tracing import set_capture_content
 
 
 class _FakeLLM:
@@ -22,6 +29,7 @@ class _FakeLLM:
     def __init__(self, completions: list[Completion]) -> None:
         self._completions = list(completions)
         self.calls: list[dict[str, Any]] = []
+        self.model = "test-model"
 
     async def complete(
         self,
@@ -952,7 +960,8 @@ async def test_run_given_successful_tool_call_logs_info_start_and_completed(
 
     info_records = [r for r in caplog.records if r.levelno == logging.INFO]
     assert any("executing" in r.message for r in info_records)
-    assert any("completed" in r.message for r in info_records)
+    [completed] = [r for r in info_records if "completed" in r.message]
+    assert isinstance(completed.duration_ms, float)
 
 
 async def test_run_given_tool_raises_does_not_also_log_info_completed(
@@ -1030,24 +1039,25 @@ async def test_run_given_no_truncation_does_not_log_info_about_it(caplog: pytest
     )
 
 
-async def test_run_given_no_tool_calls_logs_debug_calling_and_responded(
+async def test_run_given_no_tool_calls_logs_info_calling_and_responded(
     caplog: pytest.LogCaptureFixture,
 ):
-    caplog.set_level(logging.DEBUG, logger="agent.core.strategies.react")
+    caplog.set_level(logging.INFO, logger="agent.core.strategies.react")
     llm = _FakeLLM([_final_completion()])
     strategy = ReactStrategy()
 
     await strategy.run([Message(role="user", content="hi")], llm, {}, max_iterations=10)
 
-    debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
-    assert any("calling" in r.message.lower() for r in debug_records)
-    assert any("responded" in r.message.lower() for r in debug_records)
+    info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+    assert any("calling" in r.message.lower() for r in info_records)
+    [responded] = [r for r in info_records if "responded" in r.message.lower()]
+    assert isinstance(responded.duration_ms, float)
 
 
-async def test_run_given_multiple_iterations_logs_debug_once_per_iteration(
+async def test_run_given_multiple_iterations_logs_info_once_per_iteration(
     caplog: pytest.LogCaptureFixture,
 ):
-    caplog.set_level(logging.DEBUG, logger="agent.core.strategies.react")
+    caplog.set_level(logging.INFO, logger="agent.core.strategies.react")
     tools: dict[str, ITool] = {"echo": _EchoTool()}
     always_calls_tool = _tool_call_completion([_call("call_1", "echo", '{"value": "x"}')])
     llm = _FakeLLM([always_calls_tool, _final_completion("done")])
@@ -1262,6 +1272,65 @@ async def test_run_given_validation_error_log_does_not_contain_pydantic_doc_url(
     assert not any("errors.pydantic.dev" in r.message for r in caplog.records)
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "tools", "arguments", "expected_detail"),
+    [
+        ("echo", {"echo": _EchoTool()}, "{not json", "Expecting property name"),
+        ("echo", {"echo": _EchoTool()}, "{}", "Field required"),
+        ("boom", {"boom": _RaisingTool()}, "{}", "tool exploded"),
+    ],
+)
+async def test_execute_call_exception_logs_always_include_detail_and_exc_info(
+    caplog: pytest.LogCaptureFixture,
+    tool_name: str,
+    tools: dict[str, ITool],
+    arguments: str,
+    expected_detail: str,
+) -> None:
+    # Unlike this exception's span/tool-result-message content (opt-in via
+    # capture_content_enabled()), the log always gets full detail: logs never leave this
+    # process, so they're the one place full detail is safe by default.
+    caplog.set_level(logging.WARNING, logger="agent.core.strategies.react")
+
+    await react._execute_call(tools, _call("call_1", tool_name, arguments), None, None)
+
+    assert len(caplog.records) == 1
+    assert caplog.records[0].exc_info is not None
+    assert expected_detail in caplog.records[0].message
+
+
+async def test_execute_call_given_validator_raises_non_validation_error_logs_detail(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _ExplodingParams(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        value: str
+
+        @field_validator("value")
+        @classmethod
+        def _explode(cls, v: str) -> str:
+            raise KeyError("boom")
+
+    class _ExplodingValidatorTool:
+        name = "exploding_validator"
+        description = "A tool whose own validator raises something Pydantic doesn't wrap."
+        parameters_model: type[BaseModel] = _ExplodingParams
+
+        async def execute(self, **kwargs: Any) -> str:
+            return "should never reach here"
+
+    caplog.set_level(logging.WARNING, logger="agent.core.strategies.react")
+    tools: dict[str, ITool] = {"exploding_validator": _ExplodingValidatorTool()}
+
+    await react._execute_call(
+        tools, _call("call_1", "exploding_validator", '{"value": "x"}'), None, None
+    )
+
+    assert len(caplog.records) == 1
+    assert caplog.records[0].exc_info is not None
+    assert "boom" in caplog.records[0].message
+
+
 async def test_run_given_tool_output_guardrail_blocks_returns_error_tool_result_not_raise():
     guardrail = _FakeGuardrail(
         "no-secrets", "block", GuardrailFinding(triggered=True, reason="leaked a key")
@@ -1350,9 +1419,7 @@ async def test_run_given_tool_output_guardrail_blocks_truncates_error_to_max_too
     assert content is not None
     assert content.startswith("Error: too")
     assert "...[truncated," in content
-    untruncated_length = len(
-        "Error: tool result guardrail 'no-secrets' blocked this content: leaked a key"
-    )
+    untruncated_length = len("Error: tool result guardrail 'no-secrets' blocked this content")
     assert len(content) < untruncated_length
 
 
@@ -1397,3 +1464,258 @@ async def test_run_given_tool_output_guardrail_redacts_replaces_result_content()
     )
 
     assert turn.messages[1].content == "[REDACTED]"
+
+
+async def test_execute_call_opens_a_span_named_after_the_tool(monkeypatch: pytest.MonkeyPatch):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(react, "tracer", provider.get_tracer("test"))
+    tools: dict[str, ITool] = {"echo": _EchoTool()}
+
+    await react._execute_call(tools, _call("call_1", "echo", '{"value": "hi"}'), None, None)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "execute_tool echo"]
+    assert span.attributes["gen_ai.tool.name"] == "echo"
+    assert span.attributes["gen_ai.tool.call.id"] == "call_1"
+    assert "gen_ai.tool.description" not in span.attributes
+    assert span.attributes["gen_ai.tool.type"] == "function"
+    assert "gen_ai.agent.name" not in span.attributes
+    assert "gen_ai.conversation.id" not in span.attributes
+
+
+async def test_execute_call_given_capture_content_span_has_tool_description(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(react, "tracer", provider.get_tracer("test"))
+    tools: dict[str, ITool] = {"echo": _EchoTool()}
+    set_capture_content(True)
+    try:
+        await react._execute_call(tools, _call("call_1", "echo", '{"value": "hi"}'), None, None)
+    finally:
+        set_capture_content(False)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "execute_tool echo"]
+    assert span.attributes["gen_ai.tool.description"] == "Echoes its input."
+
+
+async def test_execute_call_given_active_run_context_span_has_agent_name(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(react, "tracer", provider.get_tracer("test"))
+    tools: dict[str, ITool] = {"echo": _EchoTool()}
+
+    with run_context("clock-bot", "sess-1"):
+        await react._execute_call(tools, _call("call_1", "echo", '{"value": "hi"}'), None, None)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "execute_tool echo"]
+    assert span.attributes["gen_ai.agent.name"] == "clock-bot"
+    assert span.attributes["gen_ai.conversation.id"] == "sess-1"
+
+
+async def test_execute_call_given_unoffered_tool_span_status_is_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(react, "tracer", provider.get_tracer("test"))
+
+    await react._execute_call({}, _call("call_1", "missing", "{}"), None, None)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "execute_tool missing"]
+    assert span.status.status_code == StatusCode.ERROR
+    assert span.attributes["error.type"] == "tool_not_offered"
+
+
+async def test_execute_call_given_tool_raises_span_status_description_omitted_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # The status description is a second place this same content could reach an exported
+    # span — gen_ai.tool.call.result is correctly gated a few lines away, but set_status()
+    # is a separate call that must be gated identically, not just the attribute.
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(react, "tracer", provider.get_tracer("test"))
+    tools: dict[str, ITool] = {"boom": _RaisingTool()}
+
+    await react._execute_call(tools, _call("call_1", "boom", "{}"), None, None)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "execute_tool boom"]
+    assert span.status.status_code == StatusCode.ERROR
+    assert span.status.description is None
+    assert "tool exploded" not in (span.attributes.get("gen_ai.tool.call.result") or "")
+
+
+async def test_execute_call_given_tool_raises_span_status_description_set_when_capturing_content(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(react, "tracer", provider.get_tracer("test"))
+    tools: dict[str, ITool] = {"boom": _RaisingTool()}
+    set_capture_content(True)
+    try:
+        await react._execute_call(tools, _call("call_1", "boom", "{}"), None, None)
+    finally:
+        set_capture_content(False)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "execute_tool boom"]
+    assert span.status.description is not None
+    assert "tool exploded" in span.status.description
+
+
+async def test_execute_call_given_success_span_status_is_not_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(react, "tracer", provider.get_tracer("test"))
+    tools: dict[str, ITool] = {"echo": _EchoTool()}
+
+    await react._execute_call(tools, _call("call_1", "echo", '{"value": "hi"}'), None, None)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "execute_tool echo"]
+    assert span.status.status_code != StatusCode.ERROR
+
+
+async def test_execute_call_given_success_content_starting_with_error_text_span_is_not_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Proves is_error is an explicit signal, not a content-sniff: a legitimate successful
+    # result whose text happens to start with "Error:" must not mark the span ERROR.
+    class _MisleadingSuccessTool:
+        name = "misleading"
+        description = "Returns a legitimate result that happens to start with 'Error:'."
+        parameters_model: type[BaseModel] = _EmptyParams
+
+        async def execute(self, **kwargs: Any) -> str:
+            return "Error: connection refused"
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(react, "tracer", provider.get_tracer("test"))
+    tools: dict[str, ITool] = {"misleading": _MisleadingSuccessTool()}
+
+    result = await react._execute_call(tools, _call("call_1", "misleading", "{}"), None, None)
+
+    assert result.content == "Error: connection refused"
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "execute_tool misleading"]
+    assert span.status.status_code != StatusCode.ERROR
+
+
+async def test_execute_call_given_tool_raises_span_omits_exception_event_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # A tool's own exception message can embed the tool-argument/tool-output content this
+    # is reporting on, so record_exception() is gated the same as every other span-content
+    # site — error.type alone (already content-free) identifies the failure by default.
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(react, "tracer", provider.get_tracer("test"))
+    tools: dict[str, ITool] = {"boom": _RaisingTool()}
+
+    await react._execute_call(tools, _call("call_1", "boom", "{}"), None, None)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "execute_tool boom"]
+    assert span.events == ()
+    assert span.attributes["error.type"] == "RuntimeError"
+
+
+async def test_execute_call_given_tool_raises_span_records_the_exception_when_capturing_content(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(react, "tracer", provider.get_tracer("test"))
+    tools: dict[str, ITool] = {"boom": _RaisingTool()}
+    set_capture_content(True)
+    try:
+        await react._execute_call(tools, _call("call_1", "boom", "{}"), None, None)
+    finally:
+        set_capture_content(False)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "execute_tool boom"]
+    assert len(span.events) >= 1
+    assert any(event.name == "exception" for event in span.events)
+    assert span.attributes["error.type"] == "RuntimeError"
+
+
+async def test_execute_call_given_long_arguments_span_content_is_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(react, "tracer", provider.get_tracer("test"))
+    set_capture_content(True)
+    try:
+        tools: dict[str, ITool] = {"echo": _EchoTool()}
+        long_value = "x" * 100
+        arguments = f'{{"value": "{long_value}"}}'
+
+        await react._execute_call(tools, _call("call_1", "echo", arguments), 10, None)
+
+        [span] = [s for s in exporter.get_finished_spans() if s.name == "execute_tool echo"]
+        assert span.attributes["gen_ai.tool.call.arguments"] == (
+            arguments[:10] + f"\n...[truncated, {len(arguments) - 10} more characters]"
+        )
+    finally:
+        set_capture_content(False)
+
+
+async def test_execute_call_span_has_operation_name(monkeypatch: pytest.MonkeyPatch):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(react, "tracer", provider.get_tracer("test"))
+    tools: dict[str, ITool] = {"echo": _EchoTool()}
+
+    await react._execute_call(tools, _call("call_1", "echo", '{"value": "hi"}'), None, None)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "execute_tool echo"]
+    assert span.attributes["gen_ai.operation.name"] == "execute_tool"
+
+
+async def test_run_given_concurrent_tool_calls_produces_sibling_spans(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(react, "tracer", provider.get_tracer("test"))
+    counter, max_seen = [0], [0]
+    tools: dict[str, ITool] = {"slow": _ConcurrentTool(counter, max_seen)}
+    llm = _FakeLLM(
+        [
+            _tool_call_completion([_call("c1", "slow", "{}"), _call("c2", "slow", "{}")]),
+            _final_completion(),
+        ]
+    )
+    strategy = ReactStrategy()
+
+    # ReactStrategy.run() is exercised standalone here, with no AgentRunService/agent_run.py
+    # wrapping it — in the real call chain, agent_run.py's "invoke_agent" span (Task 5) is
+    # already active for the whole call, which is what makes the two concurrent tool spans
+    # siblings under a common parent. In isolation there is no such parent, so the test opens
+    # its own enclosing span to stand in for it — this is a test-only span, not a change to
+    # production code.
+    with provider.get_tracer("test").start_as_current_span("test_root") as root:
+        await strategy.run([Message(role="user", content="go")], llm, tools, max_iterations=10)
+
+    tool_spans = [s for s in exporter.get_finished_spans() if s.name == "execute_tool slow"]
+    assert len(tool_spans) == 2
+    assert tool_spans[0].parent.span_id == tool_spans[1].parent.span_id
+    assert tool_spans[0].parent.span_id == root.get_span_context().span_id

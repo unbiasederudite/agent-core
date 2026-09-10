@@ -12,7 +12,7 @@ class RunContext(NamedTuple):
     """The (agent, session_id) pair one run executes under."""
 
     agent: str  # Agent the run executes under.
-    session_id: str | None  # Session the run executes under, or `None` for a new one.
+    session_id: str  # Session the run executes under.
 
 
 _run_context: ContextVar[RunContext | None] = ContextVar("run_context", default=None)
@@ -29,12 +29,12 @@ def current_run_context() -> RunContext | None:
 
 
 @contextmanager
-def run_context(agent: str, session_id: str | None) -> Iterator[None]:
+def run_context(agent: str, session_id: str) -> Iterator[None]:
     """Bind `(agent, session_id)` as the current run context for this block.
 
     Args:
         agent: Agent the run executes under.
-        session_id: Session the run executes under, or `None` for a new one.
+        session_id: Session the run executes under.
     """
     context_token = _run_context.set(RunContext(agent, session_id))
     usage_token = _extra_usage.set([])
@@ -43,17 +43,6 @@ def run_context(agent: str, session_id: str | None) -> Iterator[None]:
     finally:
         _run_context.reset(context_token)
         _extra_usage.reset(usage_token)
-
-
-def update_session_id(session_id: str) -> None:
-    """Update the current run context's session_id.
-
-    Args:
-        session_id: The newly created session's id.
-    """
-    current = _run_context.get()
-    if current is not None:
-        _run_context.set(RunContext(current.agent, session_id))
 
 
 def record_extra_usage(usage: Usage) -> None:

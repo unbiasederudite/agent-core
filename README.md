@@ -61,8 +61,8 @@ cp .env.example .env
 
 `config.json` is the process's full startup configuration — which models, tools, strategies,
 agents, and guardrails are available, plus process-wide settings like compaction, logging,
-session storage, and more. The example works as-is; see [CONFIG.md](CONFIG.md) when you're ready
-to customize it. `.env` holds the provider API key(s) — see `.env.example`'s comments for how a
+session storage, tracing, and more. The example works as-is; see [CONFIG.md](CONFIG.md) when
+you're ready to customize it. `.env` holds the provider API key(s) — see `.env.example`'s comments for how a
 model's provider prefix (e.g. `anthropic/...`) maps to its expected env var name.
 
 Then start the API:

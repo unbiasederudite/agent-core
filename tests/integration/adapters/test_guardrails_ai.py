@@ -10,6 +10,7 @@ from agent.adapters.llm_registry_provider import (
     LLM_REGISTRY_PROVIDER,
     register_llm_registry_provider,
 )
+from agent.core.exceptions import GuardrailBlockedError
 from agent.core.models.completion import Completion
 from agent.core.models.message import Message
 from agent.core.models.usage import Usage
@@ -67,7 +68,7 @@ async def test_check_given_block_action_and_summaries_present_returns_triggered_
 
 @patch("agent.adapters.guardrails_ai.resolve_validator")
 @patch("agent.adapters.guardrails_ai.Guard")
-async def test_check_given_block_action_and_parse_raises_returns_triggered(
+async def test_check_given_block_action_and_parse_raises_raises_guardrail_blocked(
     mock_guard_cls: MagicMock, mock_resolve: MagicMock
 ) -> None:
     mock_resolve.return_value = _mock_validator_cls()
@@ -76,16 +77,14 @@ async def test_check_given_block_action_and_parse_raises_returns_triggered(
     mock_guard_cls.return_value.use.return_value = mock_guard
 
     adapter = GuardrailsAIAdapter("judge", "guardrails/response_evaluator", {}, "block")
-    finding = await adapter.check("hello")
 
-    assert finding.triggered is True
-    assert finding.redacted_content is None
-    assert "guardrail check failed" in (finding.reason or "")
+    with pytest.raises(GuardrailBlockedError):
+        await adapter.check("hello")
 
 
 @patch("agent.adapters.guardrails_ai.resolve_validator")
 @patch("agent.adapters.guardrails_ai.Guard")
-async def test_check_given_warn_action_and_parse_raises_returns_not_triggered(
+async def test_check_given_warn_action_and_parse_raises_raises_guardrail_blocked(
     mock_guard_cls: MagicMock, mock_resolve: MagicMock
 ) -> None:
     mock_resolve.return_value = _mock_validator_cls()
@@ -94,14 +93,14 @@ async def test_check_given_warn_action_and_parse_raises_returns_not_triggered(
     mock_guard_cls.return_value.use.return_value = mock_guard
 
     adapter = GuardrailsAIAdapter("judge", "guardrails/response_evaluator", {}, "warn")
-    finding = await adapter.check("hello")
 
-    assert finding.triggered is False
+    with pytest.raises(GuardrailBlockedError):
+        await adapter.check("hello")
 
 
 @patch("agent.adapters.guardrails_ai.resolve_validator")
 @patch("agent.adapters.guardrails_ai.Guard")
-async def test_check_given_redact_action_and_parse_raises_returns_not_triggered(
+async def test_check_given_redact_action_and_parse_raises_raises_guardrail_blocked(
     mock_guard_cls: MagicMock, mock_resolve: MagicMock
 ) -> None:
     mock_resolve.return_value = _mock_validator_cls()
@@ -110,9 +109,9 @@ async def test_check_given_redact_action_and_parse_raises_returns_not_triggered(
     mock_guard_cls.return_value.use.return_value = mock_guard
 
     adapter = GuardrailsAIAdapter("judge", "guardrails/response_evaluator", {}, "redact")
-    finding = await adapter.check("hello")
 
-    assert finding.triggered is False
+    with pytest.raises(GuardrailBlockedError):
+        await adapter.check("hello")
 
 
 @patch("agent.adapters.guardrails_ai.resolve_validator")

@@ -2,6 +2,10 @@ import asyncio
 import logging
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 
 from agent.core.exceptions import (
     AgentError,
@@ -10,6 +14,7 @@ from agent.core.exceptions import (
     GuardrailBlockedError,
     InputTooLargeError,
     LLMContextWindowExceededError,
+    LLMError,
     LLMNotFoundError,
     ModelNotAllowedError,
     RequestTimeoutError,
@@ -34,12 +39,14 @@ from agent.core.registries.llm import LLMRegistry
 from agent.core.registries.strategy import StrategyRegistry
 from agent.core.registries.tool import ToolRegistry
 from agent.core.run_context import current_run_context, record_extra_usage
+from agent.core.services import agent_run
 from agent.core.services.agent_run import AgentRunService
 from agent.core.services.compaction import CompactionService
 from agent.core.services.context_tracker import ContextFootprintTracker
 from agent.core.services.cost_tracker import CostTracker
 from agent.core.session_stores.in_memory import InMemorySessionStore
 from agent.core.tools.get_current_time import GetCurrentTimeTool
+from agent.core.tracing import set_capture_content
 
 
 class _FakeStrategy:
@@ -489,6 +496,26 @@ async def test_run_given_no_session_id_creates_a_new_session_and_returns_its_id(
     assert stored[-1] == Message(role="assistant", content="hi there")
 
 
+async def test_run_records_usage_while_the_session_lock_is_still_held():
+    """Closes the eviction race: usage is recorded before the session's own lock releases."""
+    session_store = InMemorySessionStore()
+    lock_held_during_record: list[bool] = []
+
+    class _SpyCostTracker(CostTracker):
+        def record(self, agent: str, session_id: str, turn_usage: object) -> None:
+            lock = session_store._locks.get((agent, session_id))
+            lock_held_during_record.append(lock is not None and lock.locked())
+            super().record(agent, session_id, turn_usage)  # type: ignore[arg-type]
+
+    service = _service(
+        _FakeStrategy(_turn()), session_store=session_store, cost_tracker=_SpyCostTracker()
+    )
+
+    await service.run("hi", "researcher")
+
+    assert lock_held_during_record == [True]
+
+
 async def test_run_given_no_session_id_stores_only_user_and_turn_messages_not_system():
     session_store = InMemorySessionStore()
     service = _service(_FakeStrategy(_turn()), session_store=session_store)
@@ -572,6 +599,33 @@ async def test_run_given_message_exceeds_max_input_chars_raises_input_too_large_
     assert strategy.last_messages is None
 
 
+async def test_run_given_no_session_id_and_validation_fails_discards_the_new_session():
+    strategy = _FakeStrategy(_turn())
+    session_store = InMemorySessionStore()
+    service = _service(
+        strategy, agent=_researcher_agent(max_input_chars=5), session_store=session_store
+    )
+
+    with pytest.raises(InputTooLargeError):
+        await service.run("this is too long", "researcher")
+
+    assert session_store._sessions == {}
+
+
+async def test_run_given_existing_session_id_and_validation_fails_keeps_the_session():
+    strategy = _FakeStrategy(_turn())
+    session_store = InMemorySessionStore()
+    session_id = await session_store.create("researcher")
+    service = _service(
+        strategy, agent=_researcher_agent(max_input_chars=5), session_store=session_store
+    )
+
+    with pytest.raises(InputTooLargeError):
+        await service.run("this is too long", "researcher", session_id=session_id)
+
+    assert ("researcher", session_id) in session_store._sessions
+
+
 async def test_run_given_no_compaction_service_never_touches_it_and_behaves_as_before():
     strategy = _FakeStrategy(_turn())
     session_store = InMemorySessionStore()
@@ -595,14 +649,17 @@ async def test_run_given_existing_session_id_calls_maybe_compact_before_building
     assert compaction_service.maybe_compact_calls == [("researcher", session_id, "openai/gpt-4o")]
 
 
-async def test_run_given_no_session_id_never_calls_maybe_compact():
+async def test_run_given_no_session_id_calls_maybe_compact_with_the_new_session_id():
+    """A new session gets the same proactive check as a continuing one — harmless here."""
     compaction_service = _FakeCompactionService()
     strategy = _FakeStrategy(_turn())
     service = _service(strategy, compaction_service=compaction_service)
 
-    await service.run("hi", "researcher")
+    run = await service.run("hi", "researcher")
 
-    assert compaction_service.maybe_compact_calls == []
+    assert compaction_service.maybe_compact_calls == [
+        ("researcher", run.session_id, "openai/gpt-4o")
+    ]
 
 
 async def test_run_records_usage_and_context_footprint_in_cost_tracker():
@@ -723,16 +780,17 @@ async def test_run_given_no_compaction_service_context_window_exceeded_propagate
     assert not isinstance(exc_info.value, CompactionExhaustedError)
 
 
-async def test_run_given_fresh_session_context_window_exceeded_never_retries():
-    compaction_service = _FakeCompactionService(compact_result=True)
-    strategy = _FakeStrategy([LLMContextWindowExceededError("too big"), _turn("unreached")])
-    service = _service(strategy, compaction_service=compaction_service)
+async def test_run_given_no_session_id_context_window_exceeded_can_still_retry():
+    """A new session gets the same reactive-compact-and-retry chance as a continuing one."""
+    session_store = InMemorySessionStore()
+    compaction_service = _FakeCompactionService(compact_result=True, session_store=session_store)
+    strategy = _FakeStrategy([LLMContextWindowExceededError("too big"), _turn("recovered")])
+    service = _service(strategy, session_store=session_store, compaction_service=compaction_service)
 
-    with pytest.raises(LLMContextWindowExceededError) as exc_info:
-        await service.run("hi", "researcher")
+    run = await service.run("hi", "researcher")
 
-    assert not isinstance(exc_info.value, CompactionExhaustedError)
-    assert compaction_service.compact_calls == []
+    assert run.response.content == "recovered"
+    assert compaction_service.compact_calls == [("researcher", run.session_id)]
 
 
 async def test_run_passes_agent_tool_call_and_total_char_caps_to_strategy():
@@ -846,18 +904,21 @@ async def test_run_logs_started_and_completed_info(caplog: pytest.LogCaptureFixt
     await service.run("hi", "researcher")
 
     assert any("agent run started" in r.message for r in caplog.records)
-    assert any("agent run completed" in r.message for r in caplog.records)
+    [completed] = [r for r in caplog.records if "agent run completed" in r.message]
+    assert isinstance(completed.duration_ms, float)
 
 
-async def test_run_given_no_session_id_started_log_says_new(caplog: pytest.LogCaptureFixture):
+async def test_run_given_no_session_id_started_log_shows_the_new_session_id(
+    caplog: pytest.LogCaptureFixture,
+):
     caplog.set_level(logging.INFO, logger="agent.core.services.agent_run")
     strategy = _FakeStrategy(_turn())
     service = _service(strategy)
 
-    await service.run("hi", "researcher")
+    run = await service.run("hi", "researcher")
 
     [started] = [r for r in caplog.records if "agent run started" in r.message]
-    assert "new" in started.message
+    assert run.session_id in started.message
 
 
 async def test_run_given_existing_session_id_started_log_names_it(caplog: pytest.LogCaptureFixture):
@@ -912,10 +973,10 @@ async def test_run_given_reactive_retry_succeeds_logs_info(caplog: pytest.LogCap
     assert any("succeeded" in r.message for r in caplog.records)
 
 
-async def test_run_given_reactive_retry_exhausted_logs_error_with_traceback(
+async def test_run_given_reactive_retry_exhausted_logs_warning_with_traceback(
     caplog: pytest.LogCaptureFixture,
 ):
-    caplog.set_level(logging.ERROR, logger="agent.core.services.agent_run")
+    caplog.set_level(logging.WARNING, logger="agent.core.services.agent_run")
     session_store = InMemorySessionStore()
     session_id = await session_store.create("researcher")
     await session_store.append("researcher", session_id, [Message(role="user", content="hi")])
@@ -928,7 +989,7 @@ async def test_run_given_reactive_retry_exhausted_logs_error_with_traceback(
     with pytest.raises(CompactionExhaustedError):
         await service.run("again", "researcher", session_id=session_id)
 
-    [record] = caplog.records
+    [record] = [r for r in caplog.records if getattr(r, "exception_type", None) is not None]
     assert record.exc_info is not None
     assert record.exception_type == "CompactionExhaustedError"
 
@@ -1283,13 +1344,14 @@ async def test_run_given_existing_session_sets_run_context_during_strategy_call(
     assert strategy.last_run_context == ("researcher", session_id)
 
 
-async def test_run_given_new_session_sets_run_context_agent_with_no_session_id_yet():
+async def test_run_given_new_session_sets_run_context_with_the_new_session_id_upfront():
+    """The session is created before the strategy runs, so run_context has its real id."""
     strategy = _FakeStrategy(_turn())
     service = _service(strategy)
 
-    await service.run("hello", "researcher")
+    run = await service.run("hello", "researcher")
 
-    assert strategy.last_run_context == ("researcher", None)
+    assert strategy.last_run_context == ("researcher", run.session_id)
 
 
 async def test_run_given_new_session_updates_run_context_once_session_is_created():
@@ -1427,3 +1489,102 @@ async def test_run_given_tool_output_guardrails_configured_passes_them_to_strate
     await service.run("hello", "researcher")
 
     assert strategy.last_tool_output_guardrails == [guardrail]
+
+
+async def test_run_given_a_call_opens_an_invoke_agent_span(monkeypatch: pytest.MonkeyPatch):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(agent_run, "tracer", provider.get_tracer("test"))
+    service = _service(_FakeStrategy(_turn()))
+
+    run = await service.run("hi", "researcher")
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "invoke_agent researcher"]
+    assert span.attributes is not None
+    assert span.attributes["gen_ai.operation.name"] == "invoke_agent"
+    assert span.attributes["gen_ai.agent.name"] == "researcher"
+    assert span.attributes["gen_ai.conversation.id"] == run.session_id
+
+
+async def test_run_given_existing_session_id_span_has_session_id_from_the_start(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(agent_run, "tracer", provider.get_tracer("test"))
+    session_store = InMemorySessionStore()
+    session_id = await session_store.create("researcher")
+    service = _service(_FakeStrategy(_turn()), session_store=session_store)
+
+    await service.run("hi", "researcher", session_id=session_id)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "invoke_agent researcher"]
+    assert span.attributes is not None
+    assert span.attributes["gen_ai.conversation.id"] == session_id
+
+
+async def test_run_given_the_strategy_raises_span_omits_description_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # str(exc) can carry provider-echoed request content (e.g. a CompactionExhaustedError
+    # forwarding a context-window error's raw message), so it's gated like gen_ai content
+    # elsewhere; error.type alone (already content-free) identifies the failure by default.
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(agent_run, "tracer", provider.get_tracer("test"))
+    service = _service(_FakeStrategy(LLMError("boom")))
+
+    with pytest.raises(LLMError):
+        await service.run("hi", "researcher")
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "invoke_agent researcher"]
+    assert span.status.status_code == StatusCode.ERROR
+    assert span.status.description is None
+    assert span.attributes["error.type"] == "LLMError"
+    assert len(span.events) == 0
+
+
+async def test_run_given_the_strategy_raises_span_records_the_exception_when_capturing_content(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(agent_run, "tracer", provider.get_tracer("test"))
+    service = _service(_FakeStrategy(LLMError("boom")))
+    set_capture_content(True)
+    try:
+        with pytest.raises(LLMError):
+            await service.run("hi", "researcher")
+    finally:
+        set_capture_content(False)
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "invoke_agent researcher"]
+    assert span.status.status_code == StatusCode.ERROR
+    assert span.status.description == "boom"
+    assert span.attributes["error.type"] == "LLMError"
+    assert len(span.events) == 1
+
+
+async def test_run_given_a_client_error_span_does_not_record_it_as_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # A deliberate, expected rejection (here: a guardrail block) is not evidence of an
+    # operational problem — unlike a genuine LLMError, it must not inflate this span's error
+    # tracking, matching how a 4xx never marks the HTTP root span as an error either.
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(agent_run, "tracer", provider.get_tracer("test"))
+    service = _service(_FakeStrategy(GuardrailBlockedError("blocked")))
+
+    with pytest.raises(GuardrailBlockedError):
+        await service.run("hi", "researcher")
+
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "invoke_agent researcher"]
+    assert span.status.status_code != StatusCode.ERROR
+    assert "error.type" not in span.attributes
+    assert len(span.events) == 0

@@ -1,7 +1,20 @@
 """Factory for building runtime registries from configuration."""
 
+import os
 from collections.abc import Callable
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _package_version
 from typing import Any
+
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import SERVICE_NAME, SERVICE_VERSION, Resource
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import (
+    BatchSpanProcessor,
+    ConsoleSpanExporter,
+    SimpleSpanProcessor,
+)
 
 from agent.adapters import guardrails_ai
 from agent.adapters.guardrails_ai import GuardrailsAIAdapter
@@ -21,6 +34,7 @@ from agent.core.models.config import (
     SessionStoreConfig,
     StrategyConfig,
     ToolConfig,
+    TracingConfig,
 )
 from agent.core.protocols.isession_store import ISessionStore
 from agent.core.protocols.istrategy import IStrategy
@@ -33,6 +47,7 @@ from agent.core.registries.tool import ToolRegistry
 from agent.core.session_stores.in_memory import InMemorySessionStore
 from agent.core.strategies.react import ReactStrategy
 from agent.core.tools.get_current_time import GetCurrentTimeTool
+from agent.core.tracing import set_capture_content
 
 _TOOL_IMPLEMENTATIONS: dict[str, Callable[[], ITool]] = {
     "get_current_time": GetCurrentTimeTool,
@@ -42,9 +57,11 @@ _STRATEGY_IMPLEMENTATIONS: dict[str, Callable[[], IStrategy]] = {
     "react": ReactStrategy,
 }
 
-_SESSION_STORE_IMPLEMENTATIONS: dict[str, Callable[[int | None], ISessionStore]] = {
+_SESSION_STORE_IMPLEMENTATIONS: dict[str, Callable[..., ISessionStore]] = {
     "in_memory": InMemorySessionStore,
 }
+
+_DEFAULT_SERVICE_NAME = "agent-core"
 
 
 def _build_llm_registry(llm_configs: list[LLMConfig]) -> tuple[LLMRegistry, set[str]]:
@@ -253,12 +270,18 @@ def _build_agent_registry(
     return agent_registry
 
 
-def _build_session_store(config: SessionStoreConfig, max_sessions: int | None) -> ISessionStore:
+def _build_session_store(
+    config: SessionStoreConfig,
+    max_sessions: int | None,
+    on_evict: Callable[[str, str], None] | None,
+) -> ISessionStore:
     """Build the session store.
 
     Args:
         config: Session store settings.
         max_sessions: Cap on how many distinct sessions are kept at once.
+        on_evict: Called with `(agent, session_id)` when the store evicts a session, so
+            other per-session state keyed the same way can be kept in sync.
 
     Returns:
         ISessionStore: the built session store.
@@ -269,7 +292,7 @@ def _build_session_store(config: SessionStoreConfig, max_sessions: int | None) -
     implementation = _SESSION_STORE_IMPLEMENTATIONS.get(config.type)
     if implementation is None:
         raise ConfigError(f"no session store implementation registered for: {config.type}")
-    return implementation(max_sessions)
+    return implementation(max_sessions, on_evict=on_evict)
 
 
 def _validate_guardrail_list(
@@ -300,8 +323,55 @@ def _validate_guardrail_list(
         seen.add(guardrail_name)
 
 
+def _span_to_jsonl(span: ReadableSpan) -> str:
+    """Format one finished span as a single JSON Lines record.
+
+    Args:
+        span: The finished span to format.
+
+    Returns:
+        str: the span as one line of JSON, newline-terminated.
+    """
+    json_line: str = span.to_json(indent=None)
+    return json_line + "\n"
+
+
+def configure_tracing(config: TracingConfig) -> TracerProvider | None:
+    """Build and register the process-wide TracerProvider.
+
+    Args:
+        config: Tracing settings (destinations, content capture).
+
+    Returns:
+        TracerProvider | None: the provider this call built and registered, or `None` if no
+            destination was configured.
+    """
+    if not config.console and config.endpoint is None:
+        set_capture_content(False)
+        return None
+    set_capture_content(config.capture_content)
+    resource = None
+    if "OTEL_SERVICE_NAME" not in os.environ:
+        attributes: dict[str, str] = {SERVICE_NAME: _DEFAULT_SERVICE_NAME}
+        try:
+            attributes[SERVICE_VERSION] = _package_version("agent-core")
+        except PackageNotFoundError:
+            pass
+        resource = Resource.create(attributes)
+    provider = TracerProvider(resource=resource)
+    if config.console:
+        provider.add_span_processor(
+            SimpleSpanProcessor(ConsoleSpanExporter(formatter=_span_to_jsonl))
+        )
+    if config.endpoint is not None:
+        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=config.endpoint)))
+    trace.set_tracer_provider(provider)
+    return provider
+
+
 def build_registries(
     config: AppConfig,
+    on_session_evict: Callable[[str, str], None] | None = None,
 ) -> tuple[
     LLMRegistry,
     AgentRegistry,
@@ -312,16 +382,18 @@ def build_registries(
     str | None,
     CompactionConfig | None,
     LoggingConfig,
-    int | None,
+    TracingConfig,
 ]:
     """Build populated registries from already-parsed startup configuration.
 
     Args:
         config: The startup configuration.
+        on_session_evict: Called with `(agent, session_id)` when the session store evicts
+            a session, so other per-session state keyed the same way can be kept in sync.
 
     Returns:
         The five registries, the built session store, the process-wide `base_prompt`, and the
-        raw `compaction`, `logging`, and `max_sessions` config values.
+        raw `compaction`, `logging`, and `tracing` config values.
 
     Raises:
         ConfigError: if `config` is invalid.
@@ -335,7 +407,9 @@ def build_registries(
     agent_registry = _build_agent_registry(
         config.agents, known_models, known_tools, known_strategies
     )
-    session_store = _build_session_store(config.session_store, config.max_sessions)
+    session_store = _build_session_store(
+        config.session_store, config.max_sessions, on_session_evict
+    )
     if config.compaction is not None and config.compaction.model not in known_models:
         raise ConfigError(f"compaction declares unknown model: {config.compaction.model}")
 
@@ -387,5 +461,5 @@ def build_registries(
         config.base_prompt,
         config.compaction,
         config.logging,
-        config.max_sessions,
+        config.tracing,
     )

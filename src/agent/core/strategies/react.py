@@ -6,6 +6,7 @@ import logging
 import time
 from typing import Any
 
+from opentelemetry import trace
 from pydantic import ValidationError
 
 from agent.core.exceptions import GuardrailBlockedError
@@ -15,8 +16,10 @@ from agent.core.models.usage import Usage, sum_usage
 from agent.core.protocols.iguardrail import IGuardrail, run_guardrails
 from agent.core.protocols.illm import ILLM
 from agent.core.protocols.itool import ITool
+from agent.core.tracing import capture_content_enabled, stamp_run_context, truncate
 
 logger = logging.getLogger(__name__)
+tracer = trace.get_tracer(__name__)
 
 _OMITTED_MARKER = "Error: tool result omitted — aggregate tool-output budget exhausted"
 _MAX_VALIDATION_ERRORS_SHOWN = 5
@@ -42,21 +45,6 @@ def _tool_schema(tool: ITool) -> dict[str, Any]:
     }
 
 
-def _truncate(content: str, max_chars: int | None) -> str:
-    """Cap `content` at `max_chars`, appending a marker noting what was cut.
-
-    Args:
-        content: Text to cap.
-        max_chars: Cap in characters. `None` means uncapped.
-
-    Returns:
-        str: `content`, truncated if it exceeded `max_chars`.
-    """
-    if max_chars is None or len(content) <= max_chars:
-        return content
-    return content[:max_chars] + f"\n...[truncated, {len(content) - max_chars} more characters]"
-
-
 def _apply_aggregate_budget(
     results: list[Message], running_total: int, max_total_chars: int | None
 ) -> tuple[list[Message], int]:
@@ -68,7 +56,7 @@ def _apply_aggregate_budget(
         max_total_chars: Cap in characters. `None` means uncapped.
 
     Returns:
-        The updated results and running total.
+        tuple[list[Message], int]: the updated results and running total.
     """
     if max_total_chars is None:
         return results, running_total + sum(len(message.content or "") for message in results)
@@ -110,15 +98,15 @@ def _format_validation_error(exc: ValidationError) -> str:
         exc: The validation error to format.
 
     Returns:
-        A short, bounded error message.
+        str: a short, bounded error message.
     """
     errors = exc.errors()
     parts = []
     for err in errors[:_MAX_VALIDATION_ERRORS_SHOWN]:
         field = ".".join(str(loc) for loc in err["loc"]) or "(root)"
         parts.append(
-            f"{_truncate(field, _MAX_VALIDATION_FIELD_CHARS)}: "
-            f"{_truncate(err['msg'], _MAX_VALIDATION_FIELD_CHARS)}"
+            f"{truncate(field, _MAX_VALIDATION_FIELD_CHARS)}: "
+            f"{truncate(err['msg'], _MAX_VALIDATION_FIELD_CHARS)}"
         )
     message = "; ".join(parts)
     omitted = len(errors) - _MAX_VALIDATION_ERRORS_SHOWN
@@ -144,6 +132,44 @@ def _skipped_call_message(call: ToolCall, max_tool_calls_per_round: int) -> Mess
     )
 
 
+def _traced_result(span: trace.Span, message: Message, *, error_type: str | None = None) -> Message:
+    """Attach `message`'s content to `span`, and mark it ERROR if `error_type` is given.
+
+    Args:
+        span: The tool call's span.
+        message: The role="tool" result message about to be returned.
+        error_type: A low-cardinality error identifier if this result represents a
+            tool-call failure, e.g. an exception class name; `None` for a success.
+
+    Returns:
+        Message: `message`, unchanged.
+    """
+    if error_type is not None:
+        description = message.content if capture_content_enabled() else None
+        span.set_status(trace.Status(trace.StatusCode.ERROR, description))
+        span.set_attribute("error.type", error_type)
+    if capture_content_enabled() and message.content is not None:
+        span.set_attribute("gen_ai.tool.call.result", message.content)
+    return message
+
+
+def _traced_error_result(
+    span: trace.Span, call: ToolCall, message: str, error_type: str
+) -> Message:
+    """Build and trace an error tool-result message for `call`.
+
+    Args:
+        span: The tool call's span.
+        call: The tool call this result answers.
+        message: The error text to return to the LLM.
+        error_type: A low-cardinality error identifier, e.g. an exception class name.
+
+    Returns:
+        Message: the role="tool" error result message.
+    """
+    return _traced_result(span, _tool_result_message(call, message), error_type=error_type)
+
+
 async def _execute_call(
     tools: dict[str, ITool],
     call: ToolCall,
@@ -161,65 +187,126 @@ async def _execute_call(
             returned. None or empty means no check.
 
     Returns:
-        A role="tool" result message.
+        Message: a role="tool" result message.
     """
     name = call.function.name
-    tool = tools.get(name)
-    if tool is None:
-        logger.warning("tool call named '%s', which was not offered for this call", name)
-        return _tool_result_message(call, f"Error: tool '{name}' was not offered for this call")
-    try:
-        arguments = json.loads(call.function.arguments)
-    except json.JSONDecodeError as exc:
-        logger.warning("tool '%s' call had malformed JSON arguments: %s", name, exc)
-        return _tool_result_message(call, f"Error: invalid arguments: {exc}")
-    if not isinstance(arguments, dict):
-        logger.warning("tool '%s' call arguments were not a JSON object", name)
-        return _tool_result_message(call, "Error: arguments must be a JSON object")
-    try:
-        validated = tool.parameters_model.model_validate(arguments)
-    except ValidationError as exc:
-        formatted = _format_validation_error(exc)
-        logger.warning("tool '%s' call failed argument validation: %s", name, formatted)
-        return _tool_result_message(call, f"Error: invalid arguments: {formatted}")
-    except Exception as exc:  # noqa: BLE001 — a tool's own validator can raise anything
-        logger.warning(
-            "tool '%s' argument validation raised: %s",
-            name,
-            exc,
-            extra={"exception_type": type(exc).__name__},
-        )
-        return _tool_result_message(call, f"Error: invalid arguments for tool '{name}'")
-    logger.info("executing tool '%s'", name)
-    start = time.monotonic()
-    try:
-        result = await tool.execute(**validated.model_dump())
-        if tool_output_guardrails:
-            try:
-                result = await run_guardrails(result, tool_output_guardrails)
-            except GuardrailBlockedError as exc:
-                duration_ms = (time.monotonic() - start) * 1000
-                logger.info(
-                    "tool '%s' result blocked by guardrail after %.1fms: %s",
-                    name,
-                    duration_ms,
-                    exc,
-                )
-                return _tool_result_message(
-                    call, _truncate(f"Error: tool result {exc}", max_tool_result_chars)
-                )
-        duration_ms = (time.monotonic() - start) * 1000
-        logger.info(
-            "tool '%s' completed in %.1fms, result length %d", name, duration_ms, len(result)
-        )
-        return _tool_result_message(call, _truncate(result, max_tool_result_chars))
-    except Exception as exc:  # noqa: BLE001 — tool can raise anything, or violate -> str; never crash
-        logger.warning(
-            "tool '%s' raised: %s", name, exc, extra={"exception_type": type(exc).__name__}
-        )
-        return _tool_result_message(
-            call, _truncate(f"Error: tool '{name}' failed: {exc}", max_tool_result_chars)
-        )
+    with tracer.start_as_current_span(
+        f"execute_tool {name}", record_exception=False, set_status_on_exception=False
+    ) as span:
+        span.set_attribute("gen_ai.operation.name", "execute_tool")
+        span.set_attribute("gen_ai.tool.name", name)
+        span.set_attribute("gen_ai.tool.call.id", call.id)
+        stamp_run_context(span)
+        if capture_content_enabled():
+            span.set_attribute(
+                "gen_ai.tool.call.arguments",
+                truncate(call.function.arguments, max_tool_result_chars),
+            )
+        tool = tools.get(name)
+        if tool is not None:
+            if capture_content_enabled():
+                span.set_attribute("gen_ai.tool.description", tool.description)
+            span.set_attribute("gen_ai.tool.type", "function")
+        if tool is None:
+            logger.warning("tool call named '%s', which was not offered for this call", name)
+            return _traced_error_result(
+                span,
+                call,
+                f"Error: tool '{name}' was not offered for this call",
+                "tool_not_offered",
+            )
+        try:
+            arguments = json.loads(call.function.arguments)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "tool '%s' call had malformed JSON arguments: %s",
+                name,
+                exc,
+                exc_info=True,
+            )
+            return _traced_error_result(
+                span, call, f"Error: invalid arguments: {exc}", type(exc).__name__
+            )
+        if not isinstance(arguments, dict):
+            logger.warning("tool '%s' call arguments were not a JSON object", name)
+            return _traced_error_result(
+                span, call, "Error: arguments must be a JSON object", "invalid_arguments_type"
+            )
+        try:
+            validated = tool.parameters_model.model_validate(arguments)
+        except ValidationError as exc:
+            formatted = _format_validation_error(exc)
+            logger.warning(
+                "tool '%s' call failed argument validation: %s",
+                name,
+                formatted,
+                exc_info=True,
+            )
+            return _traced_error_result(
+                span, call, f"Error: invalid arguments: {formatted}", type(exc).__name__
+            )
+        except Exception as exc:  # noqa: BLE001 — a tool's own validator can raise anything
+            logger.warning(
+                "tool '%s' argument validation raised: %s",
+                name,
+                exc,
+                extra={"exception_type": type(exc).__name__},
+                exc_info=True,
+            )
+            return _traced_error_result(
+                span, call, f"Error: invalid arguments for tool '{name}'", type(exc).__name__
+            )
+        logger.info("executing tool '%s'", name)
+        start = time.monotonic()
+        try:
+            result = await tool.execute(**validated.model_dump())
+            if tool_output_guardrails:
+                try:
+                    result = await run_guardrails(
+                        result, tool_output_guardrails, "tool_output_guardrails"
+                    )
+                except GuardrailBlockedError as exc:
+                    duration_ms = (time.monotonic() - start) * 1000
+                    logger.info(
+                        "tool '%s' result blocked by guardrail after %.1fms: %s",
+                        name,
+                        duration_ms,
+                        exc,
+                        extra={"duration_ms": duration_ms},
+                    )
+                    return _traced_error_result(
+                        span,
+                        call,
+                        truncate(f"Error: tool result {exc}", max_tool_result_chars),
+                        type(exc).__name__,
+                    )
+            duration_ms = (time.monotonic() - start) * 1000
+            logger.info(
+                "tool '%s' completed in %.1fms, result length %d",
+                name,
+                duration_ms,
+                len(result),
+                extra={"duration_ms": duration_ms},
+            )
+            return _traced_result(
+                span, _tool_result_message(call, truncate(result, max_tool_result_chars))
+            )
+        except Exception as exc:  # noqa: BLE001 — tool can raise anything, or violate -> str; never crash
+            logger.warning(
+                "tool '%s' raised: %s",
+                name,
+                exc,
+                extra={"exception_type": type(exc).__name__},
+                exc_info=True,
+            )
+            if capture_content_enabled():
+                span.record_exception(exc)
+            return _traced_error_result(
+                span,
+                call,
+                truncate(f"Error: tool '{name}' failed: {exc}", max_tool_result_chars),
+                type(exc).__name__,
+            )
 
 
 class ReactStrategy:
@@ -266,7 +353,7 @@ class ReactStrategy:
         tool_results_total_chars = 0
 
         for iteration in range(1, max_iterations + 1):
-            logger.debug("calling the LLM, iteration %d/%d", iteration, max_iterations)
+            logger.info("calling the LLM, iteration %d/%d", iteration, max_iterations)
             start = time.monotonic()
             completion = await llm.complete(
                 messages,
@@ -276,7 +363,7 @@ class ReactStrategy:
                 tools=tool_schemas,
             )
             duration_ms = (time.monotonic() - start) * 1000
-            logger.debug(
+            logger.info(
                 "LLM responded, iteration %d/%d: finish_reason=%s prompt=%d completion=%d "
                 "total=%d, %.1fms",
                 iteration,
@@ -286,6 +373,7 @@ class ReactStrategy:
                 completion.usage.completion_tokens,
                 completion.usage.total_tokens,
                 duration_ms,
+                extra={"duration_ms": duration_ms},
             )
             total_usage = sum_usage(total_usage, completion.usage)
             if not completion.message.tool_calls:
@@ -330,14 +418,14 @@ class ReactStrategy:
         logger.warning(
             "max_iterations (%d) exhausted, forcing a final call without tools", max_iterations
         )
-        logger.debug("calling the LLM for the forced final answer")
+        logger.info("calling the LLM for the forced final answer")
         start = time.monotonic()
         final = await llm.complete(
             [
                 *messages,
                 Message(
                     role="user",
-                    content="No further tool calls are available. Provide your final answer now.",
+                    content=("No further tool calls are available. Provide your final answer now."),
                 ),
             ],
             temperature=temperature,
@@ -346,7 +434,7 @@ class ReactStrategy:
             tools=None,
         )
         duration_ms = (time.monotonic() - start) * 1000
-        logger.debug(
+        logger.info(
             "LLM responded (forced final): finish_reason=%s prompt=%d completion=%d total=%d, "
             "%.1fms",
             final.finish_reason,
@@ -354,6 +442,7 @@ class ReactStrategy:
             final.usage.completion_tokens,
             final.usage.total_tokens,
             duration_ms,
+            extra={"duration_ms": duration_ms},
         )
         total_usage = sum_usage(total_usage, final.usage)
         messages.append(final.message)

@@ -5,31 +5,35 @@ class AgentError(Exception):
     """Root of the agent-core exception hierarchy."""
 
 
+class ClientError(AgentError):
+    """A deliberate, expected rejection based on the request or current state."""
+
+
 class ConfigError(AgentError):
     """Raised when startup configuration is invalid."""
 
 
-class LLMNotFoundError(AgentError):
+class LLMNotFoundError(ClientError):
     """Raised when a requested LLM name is not registered."""
 
 
-class AgentNotFoundError(AgentError):
+class AgentNotFoundError(ClientError):
     """Raised when a requested agent name is not registered."""
 
 
-class ToolNotFoundError(AgentError):
+class ToolNotFoundError(ClientError):
     """Raised when a requested tool name is not registered."""
 
 
-class StrategyNotFoundError(AgentError):
+class StrategyNotFoundError(ClientError):
     """Raised when a requested reasoning strategy name is not registered."""
 
 
-class GuardrailNotFoundError(AgentError):
+class GuardrailNotFoundError(ClientError):
     """Raised when a requested guardrail name is not registered."""
 
 
-class SessionNotFoundError(AgentError):
+class SessionNotFoundError(ClientError):
     """Raised when a requested (agent, session_id) pair is not registered."""
 
 
@@ -57,11 +61,11 @@ class CompactionExhaustedError(LLMContextWindowExceededError):
     """Raised when compaction was tried and the request still doesn't fit."""
 
 
-class InputTooLargeError(AgentError):
+class InputTooLargeError(ClientError):
     """Raised when a request's `message` exceeds the agent's configured `max_input_chars`."""
 
 
-class SessionBusyError(AgentError):
+class SessionBusyError(ClientError):
     """Raised when a request targets a session another operation is currently using."""
 
 
@@ -69,17 +73,17 @@ class RequestTimeoutError(AgentError):
     """Raised when a single request exceeds its agent's configured `max_request_seconds`."""
 
 
-class ToolNotAllowedError(AgentError):
+class ToolNotAllowedError(ClientError):
     """Raised when a request names a tool that is registered but not permitted for this agent."""
 
 
-class ModelNotAllowedError(AgentError):
+class ModelNotAllowedError(ClientError):
     """Raised when a request names a model that is registered but not permitted for this agent."""
 
 
-class StrategyNotAllowedError(AgentError):
+class StrategyNotAllowedError(ClientError):
     """Raised when a request names a strategy that is registered but not permitted for the agent."""
 
 
-class GuardrailBlockedError(AgentError):
+class GuardrailBlockedError(ClientError):
     """Raised when a block-action guardrail triggers on the input or final-output checkpoint."""

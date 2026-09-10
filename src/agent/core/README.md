@@ -10,3 +10,4 @@ All agent intelligence.
 - `exceptions/` — the `AgentError` hierarchy
 - `session_stores/` — per-conversation message history storage implementations
 - `run_context/` — per-run `(agent, session_id)` correlation context, threaded through logging
+- `tracing/` — process-wide content-capture flag

@@ -13,6 +13,7 @@ from guardrails.settings import settings as guardrails_settings
 from guardrails.validator_base import get_validator_class
 
 from agent.adapters.llm_registry_provider import guardrail_call_scope
+from agent.core.exceptions import GuardrailBlockedError
 from agent.core.models.guardrail import GuardrailFinding
 
 guardrails_settings.disable_tracing = True
@@ -21,7 +22,7 @@ guardrails_settings.disable_tracing = True
 # contextvars, silently dropping any per-call state threaded through from the caller. Forcing
 # synchronous dispatch keeps a validator's own LLM call on the calling thread instead, at the
 # cost of validators no longer running concurrently within one check.
-os.environ.setdefault("GUARDRAILS_RUN_SYNC", "true")
+os.environ["GUARDRAILS_RUN_SYNC"] = "true"
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,9 @@ class GuardrailsAIAdapter:
 
         Returns:
             GuardrailFinding: the check's result.
+
+        Raises:
+            GuardrailBlockedError: the underlying validator raised.
         """
         try:
             with guardrail_call_scope() as call_kwargs:
@@ -163,9 +167,10 @@ class GuardrailsAIAdapter:
                 exc_info=True,
                 extra={"exception_type": type(exc).__name__},
             )
-            if self.action == "block":
-                return GuardrailFinding(triggered=True, reason=f"guardrail check failed: {exc}")
-            return GuardrailFinding(triggered=False)
+            # Regardless of this guardrail's own action (block, redact, warn): a failed
+            # check can't tell whether its content was safe, so it's treated as if it had
+            # blocked rather than let unverified content through unfiltered.
+            raise GuardrailBlockedError(f"guardrail '{self.name}' check failed") from exc
         summaries = result.validation_summaries or []
         if not summaries:
             return GuardrailFinding(triggered=False)

@@ -88,14 +88,16 @@
   },
   "logging": {
     "level": "INFO",
-    "format": "text",
-    "console": true,
-    "file": "logs/agent.log",
-    "file_max_bytes": 10000000,
-    "file_backup_count": 5
+    "format": "text"
   },
   "session_store": {
     "type": "in_memory"
   },
-  "max_sessions": 1000
+  "tracing": {
+    "console": false,
+    "endpoint": null,
+    "capture_content": false
+  },
+  "max_sessions": 1000,
+  "max_concurrent_requests": 100
 }
